@@ -11,6 +11,11 @@
  *   /api/stats-panel/balances  — per-channel account statuses (balance /
  *                                plan quota / usage windows; 60s cache)
  *
+ * Data files under DATA_DIR: records.jsonl (detail rows at/after the last
+ * stable compaction cutoff), archive.json (exact aggregates over every folded
+ * row; rows at or after the cutoff remain in records.jsonl), backfill-state.json
+ * (persisted revisions are tracked; unchanged non-live sessions can be skipped).
+ *
  * Channel account probes are adapter-dispatched by base URL — see
  * probeChannel() and docs/CHANNELS.md for adding providers.
  */
@@ -20,7 +25,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -33,6 +38,23 @@ export const inject = ['webServer']
 /** Where the durable usage log lives. */
 const DATA_DIR = join(homedir(), '.dsh', 'stats-panel')
 const RECORDS_FILE = join(DATA_DIR, 'records.jsonl')
+
+/**
+ * Compacted aggregates — the sole store of the folded detail prefix. Rows
+ * folded into the archive are not kept individually; rows at/after `cutoffTs`
+ * remain in records.jsonl. The cutoff is applied while loading and collecting,
+ * so a crash between the two writes can never double-count (see compactRecords).
+ */
+const ARCHIVE_FILE = join(DATA_DIR, 'archive.json')
+
+/** Persisted session revisions used to skip unchanged backfill work. */
+const BACKFILL_STATE_FILE = join(DATA_DIR, 'backfill-state.json')
+
+/** Default compaction trigger (records in memory). */
+const COMPACT_MAX_RECORDS_DEFAULT = 10_000
+
+/** MiMo 平台控制台登录 Cookie 文件（用于自动查询 Token Plan 套餐用量）。 */
+const MIMO_COOKIE_FILE = join(DATA_DIR, 'mimo-cookie.txt')
 
 /** One collected model call. */
 export interface UsageRecord {
@@ -63,6 +85,10 @@ export interface StatsSummary {
   modelStats: ModelStats[]
   channelStats: ChannelStats[]
   dailyStats: DailyStats[]
+  /** ISO-8601 week buckets, keyed `YYYY-Www`, ascending. */
+  weeklyStats: DailyStats[]
+  /** Calendar month buckets, keyed `YYYY-MM`, ascending. */
+  monthlyStats: DailyStats[]
   recentRecords: UsageRecord[]
 }
 
@@ -100,7 +126,7 @@ export interface ChannelBalance {
   balance?: string
   currency?: string
   /** Plan quota buckets (plan kind): percent used 0-100 and the reset time. */
-  quota?: Array<{ label: string; percent: number; resetsAt: string }>
+  quota?: Array<{ label: string; percent: number; resetsAt: string; used?: number; limit?: number }>
   /** Usage buckets (usage kind): tokens consumed over recent windows (e.g. 5h / 7d / 30d). */
   usage?: Array<{ label: string; inputTokens: number; outputTokens: number }>
   /** Manual note (manual kind). */
@@ -112,19 +138,88 @@ export interface ChannelBalance {
 }
 
 export interface DailyStats {
+  /**
+   * The bucket key. Retains the name `date` (rather than `period`) so the
+   * pre-existing `dailyStats` shape stays source-compatible; `period` below
+   * carries the same value under a period-neutral name.
+   */
   date: string
+  /** Same value as {@link DailyStats.date}, named for week/month reuse. */
+  period: string
   calls: number
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  reasoningTokens: number
   totalTokens: number
 }
 
-/** Loopback literal check plus browser same-origin markers (mirrors dsh-ssh). */
-function isLoopbackRequest(request: IncomingMessage): boolean {
+/** The loopback hostnames a request's `Host` header may name. */
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1'])
+
+/** Canonicalize URL hostnames for case-insensitive and bracketed IPv6 comparison. */
+function normalizeHostname(hostname: string): string {
+  const lower = hostname.toLowerCase()
+  return lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower
+}
+
+/** Whether `address` is a loopback peer literal. */
+function isLoopbackAddress(address: string): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+/**
+ * Strip an IPv4-mapped IPv6 prefix so `::ffff:192.168.1.9` compares as the
+ * IPv4 literal Node would have reported on an IPv4 socket.
+ */
+function normalizePeer(address: string): string {
+  return address.startsWith('::ffff:') ? address.slice(7) : address
+}
+
+/**
+ * Whether `address` sits in a private (non-routable) range: RFC1918 IPv4,
+ * IPv4 link-local, IPv6 unique-local (fc00::/7) or IPv6 link-local (fe80::/10).
+ * A public address is never treated as LAN, so exposing the port to the
+ * internet cannot silently widen who may read usage data.
+ */
+function isPrivateAddress(address: string): boolean {
+  const peer = normalizePeer(address).toLowerCase()
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(peer)
+  if (v4 !== null) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])]
+    if (a === 10) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 192 && b === 168) return true
+    if (a === 169 && b === 254) return true
+    return false
+  }
+  if (peer.startsWith('fe8') || peer.startsWith('fe9') || peer.startsWith('fea') || peer.startsWith('feb')) return true
+  return peer.startsWith('fc') || peer.startsWith('fd')
+}
+
+/**
+ * Whether a stats request may be served.
+ *
+ * Loopback is always trusted. A private-range peer is trusted only when the
+ * `Host` authority it addressed is one of `lanHosts` — the operator-declared
+ * set of LAN authorities this panel answers on — which keeps an undeclared
+ * host (a DNS-rebinding target, or a second interface the operator did not
+ * mean to publish) rejected even though the peer's address looks local.
+ *
+ * On top of the peer/authority pair the browser's own same-origin markers are
+ * enforced for every caller: an explicit `sec-fetch-site: cross-site`, or an
+ * `Origin` whose host differs from the addressed authority, is refused. That is
+ * what stops a page on another origin from reading usage data through the
+ * visitor's browser.
+ *
+ * @param request - the inbound request.
+ * @param lanHosts - hostnames (no port) that may be addressed from the LAN; empty means loopback-only.
+ * @returns whether the request is allowed to read stats.
+ */
+export function isStatsRequestAllowed(request: IncomingMessage, lanHosts: readonly string[] = []): boolean {
   const address = request.socket.remoteAddress
-  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
+  if (typeof address !== 'string') return false
   const host = request.headers.host
   if (typeof host !== 'string') return false
   let hostUrl: URL
@@ -133,7 +228,17 @@ function isLoopbackRequest(request: IncomingMessage): boolean {
   } catch {
     return false
   }
-  if (hostUrl.hostname !== '127.0.0.1' && hostUrl.hostname !== 'localhost' && hostUrl.hostname !== '[::1]') return false
+
+  const hostname = normalizeHostname(hostUrl.hostname)
+  const loopback = isLoopbackAddress(address)
+  if (loopback) {
+    if (!LOOPBACK_HOSTNAMES.has(hostname)) return false
+  } else {
+    // A LAN peer must both be private and have addressed a declared authority.
+    if (!isPrivateAddress(address)) return false
+    if (!lanHosts.some(entry => normalizeHostname(entry) === hostname)) return false
+  }
+
   if (request.headers['sec-fetch-site'] === 'cross-site') return false
   const origin = request.headers.origin
   if (origin === undefined) return true
@@ -201,11 +306,47 @@ function readProviderConfigs(): ProviderConfig[] {
   return configs
 }
 
-/** Minimal YAML subset parser for settings.yaml provider maps (indent + key: value). */
+/**
+ * The LAN authorities this panel may answer stats requests on, read from
+ * `stats-panel.lanHosts` in ~/.dsh/settings.yaml:
+ *
+ * ```yaml
+ * stats-panel:
+ *   lanHosts: [172.19.81.21, dsh.local]
+ * ```
+ *
+ * Absent or empty means loopback-only — the pre-existing behaviour — so simply
+ * upgrading never widens who can read usage data; the operator opts in by
+ * naming each authority.
+ * @returns the declared hostnames (no ports), or an empty list.
+ */
+function readLanHosts(): string[] {
+  try {
+    const root = parseSimpleYaml(readFileSync(SETTINGS_PATH, 'utf8')) as Record<string, unknown>
+    const panel = root['stats-panel'] as Record<string, unknown> | undefined
+    const declared = panel?.['lanHosts']
+    if (typeof declared === 'string') {
+      // Accept both `lanHosts: a` and the inline-list form `lanHosts: [a, b]`.
+      return declared
+        .replace(/^\[|\]$/g, '')
+        .split(',')
+        .map(entry => entry.trim().replace(/^['"]|['"]$/g, ''))
+        .filter(entry => entry !== '')
+    }
+    if (Array.isArray(declared)) {
+      return declared.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '').map(entry => entry.trim())
+    }
+  } catch {
+    // Unreadable settings: stay loopback-only.
+  }
+  return []
+}
+
+/** Minimal YAML subset parser for settings.yaml provider maps (indent-aware, nested). */
 function parseSimpleYaml(text: string): Record<string, unknown> {
   const root: Record<string, unknown> = {}
-  let current: Record<string, unknown> | undefined
-  let currentKey = ''
+  // Stack of open containers: ((indent, map)); nested maps are pushed on `key:` lines.
+  const stack: Array<{ indent: number; map: Record<string, unknown> }> = [{ indent: -1, map: root }]
   for (const line of text.split('\n')) {
     const trimmed = line.trim()
     if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('-')) continue
@@ -214,28 +355,64 @@ function parseSimpleYaml(text: string): Record<string, unknown> {
     if (match === null) continue
     const key = match[1]
     const value = match[2].trim()
-    if (indent === 0) {
-      current = {}
-      currentKey = key
-      root[key] = current
-    } else if (current !== undefined && indent >= 2) {
-      if (value === '') {
-        current[key] = {}
-      } else {
-        current[key] = value
-      }
+    // Pop containers that are deeper than this line.
+    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop()
+    const parent = stack[stack.length - 1].map
+    if (value === '') {
+      const child: Record<string, unknown> = {}
+      parent[key] = child
+      stack.push({ indent, map: child })
+    } else {
+      parent[key] = value
     }
   }
   return root
 }
 
+/** Read the MiMo platform login Cookie from env or the local cookie file. */
+function readMimoCookie(): string | undefined {
+  const fromEnv = process.env['MIMO_PLATFORM_COOKIE']
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim()
+  try {
+    if (existsSync(MIMO_COOKIE_FILE)) {
+      const content = readFileSync(MIMO_COOKIE_FILE, 'utf8').trim()
+      if (content !== '') return content
+    }
+  } catch {
+    // Fall through to undefined (manual mode).
+  }
+  return undefined
+}
+
 /** Fetch with a bounded timeout; throws on non-OK or network failure. */
-async function probeJson(url: string, headers: Record<string, string>): Promise<Record<string, unknown>> {
-  const response = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) })
+async function probeJson(url: string, headers: Record<string, string>, timeoutMs = 10_000): Promise<Record<string, unknown>> {
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   const body = await response.json() as unknown
   if (typeof body !== 'object' || body === null) throw new Error('invalid JSON response')
   return body as Record<string, unknown>
+}
+
+/** Fetch with retry; useful for flaky external usage/quota endpoints. */
+async function probeJsonWithRetry(
+  url: string,
+  headers: Record<string, string>,
+  options: { timeoutMs?: number; retries?: number } = {},
+): Promise<Record<string, unknown>> {
+  const timeoutMs = options.timeoutMs ?? 10_000
+  const retries = options.retries ?? 0
+  let lastError: unknown
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await probeJson(url, headers, timeoutMs)
+    } catch (e) {
+      lastError = e
+      // Do not retry deterministic client errors (4xx), except 429 rate-limit.
+      if (e instanceof Error && /^HTTP 4\d\d$/.test(e.message) && !/^HTTP 429$/.test(e.message)) throw e
+      if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+  throw lastError
 }
 
 function numField(obj: Record<string, unknown>, field: string): number | undefined {
@@ -246,6 +423,238 @@ function numField(obj: Record<string, unknown>, field: string): number | undefin
     return Number.isFinite(parsed) ? parsed : undefined
   }
   return undefined
+}
+
+/** 金额文案（USD/CNY 通用）：≥1B → B，≥1M → M，其余千分位两位小数。 */
+function amountText(amount: number): string {
+  const abs = Math.abs(amount)
+  if (abs >= 1e9) return `${(amount / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${(amount / 1e6).toFixed(2)}M`
+  return amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/** 紧凑 token 文案（note 拼接用）：1.56B / 753M / 82.4K。 */
+function tokensShort(tokens: number): string {
+  const abs = Math.abs(tokens)
+  if (abs >= 1e9) return `${(tokens / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${(tokens / 1e6).toFixed(1)}M`
+  if (abs >= 1e3) return `${(tokens / 1e3).toFixed(1)}K`
+  return String(Math.round(tokens))
+}
+
+/** NewAPI 无限额度令牌在 subscription 端点上的哨兵值（hard_limit_usd = 1e8）。 */
+const NEWAPI_UNLIMITED_SENTINEL = 100_000_000
+
+/** new-api 默认额度换算：$1 = 500000 quota（QuotaPerUnit）。 */
+const NEWAPI_QUOTA_PER_UNIT = 500_000
+
+/** 由 apiKeyEnv 推导控制台访问令牌的凭据名：AGENTROUTER_API_KEY → AGENTROUTER_ACCESS_TOKEN。 */
+function accessTokenEnvOf(apiKeyEnv: string): string {
+  return apiKeyEnv.endsWith('_API_KEY')
+    ? apiKeyEnv.slice(0, -'_API_KEY'.length) + '_ACCESS_TOKEN'
+    : apiKeyEnv + '_ACCESS_TOKEN'
+}
+
+/**
+ * 控制台会话文件：`DATA_DIR/<provider>-cookie.txt`，内容为浏览器登录态的
+ * Cookie 头（如 `session=...`），可附 `new-api-user=<id>`（new-api 系控制台
+ * API 要求该头）。读取失败返回 undefined。
+ */
+function readConsoleSession(provider: string): { cookie: string; newApiUser?: string } | undefined {
+  try {
+    const file = join(DATA_DIR, `${provider}-cookie.txt`)
+    if (!existsSync(file)) return undefined
+    const raw = readFileSync(file, 'utf8').trim()
+    if (raw === '') return undefined
+    const userMatch = /(?:^|;\s*)new-api-user=(\d+)/.exec(raw)
+    return {
+      cookie: raw,
+      newApiUser: userMatch?.[1],
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether a probe failure means "the network/upstream is broken" (as opposed
+ * to "this site just is not a NewAPI/Sub2API gateway"): HTTP status answers
+ * are protocol-level rejections, everything else (timeout, DNS, refused,
+ * aborted) means the attempt never got a real answer.
+ */
+function isNetworkProbeError(e: unknown): boolean {
+  return e instanceof Error && !/^HTTP \d+$/.test(e.message)
+}
+
+/**
+ * NewAPI / one-api 系中转站的 OpenAI 计费模拟端点（AgentRouter 等均支持）：
+ * `GET <base>/dashboard/billing/subscription` 返回 `hard_limit_usd`，
+ * `GET <base>/dashboard/billing/usage` 返回 `total_usage`（美分）。
+ * 语义：hard_limit = 剩余 + 已用（总额度），故余额 = hard_limit - used。
+ * 例外：key 为无限额度令牌时 hard_limit 恒为 1e8 哨兵值，余额在用户配额上，
+ * 只能走控制台接口 `/api/user/self`：优先 `<provider>-cookie.txt` 会话
+ * （经本地浏览器桥时 Cookie 由桥注入，另发 `New-Api-User` 头），其次访问
+ * 令牌凭据 `<XXX>_ACCESS_TOKEN`；都没有则回退手动填写并说明。
+ * `diag.note` collects the last network-level failure so the caller can show
+ * "查询失败" instead of mistaking it for an unconfigurable channel.
+ * @returns 余额/手动行；返回 undefined 表示该站不是 NewAPI 系。
+ */
+async function probeNewApiBilling(
+  config: ProviderConfig,
+  base: string,
+  key: string,
+  now: number,
+  resolveKey: (name: string) => Promise<string | undefined>,
+  diag: { note?: string } = {},
+): Promise<ChannelBalance | undefined> {
+  let sub: Record<string, unknown>
+  try {
+    sub = await probeJsonWithRetry(`${base}/dashboard/billing/subscription`, { authorization: `Bearer ${key}` }, { timeoutMs: 12_000, retries: 1 })
+  } catch (e) {
+    if (isNetworkProbeError(e)) diag.note = `上游查询失败：${e instanceof Error ? e.message : String(e)}`
+    return undefined
+  }
+  const totalUsd = numField(sub, 'hard_limit_usd') ?? numField(sub, 'system_hard_limit_usd')
+  if (totalUsd === undefined) return undefined
+  let usedUsd = 0
+  try {
+    const fmt = (d: Date): string => d.toISOString().slice(0, 10)
+    const end = new Date()
+    const start = new Date(end.getTime() - 30 * 86_400_000)
+    const usage = await probeJson(
+      `${base}/dashboard/billing/usage?start_date=${fmt(start)}&end_date=${fmt(end)}`,
+      { authorization: `Bearer ${key}` }, 12_000,
+    )
+    usedUsd = (numField(usage, 'total_usage') ?? 0) / 100
+  } catch {
+    // 用量查询失败不阻塞余额展示。
+  }
+
+  // 无限额度令牌：subscription 的 1e8 是哨兵值，不是余额。改走控制台
+  // 用户配额接口（sk key 查不到）。
+  if (totalUsd >= NEWAPI_UNLIMITED_SENTINEL) {
+    const origin = new URL(base).origin
+    const hint = `余额在用户配额上（无限额度令牌，已用 $${amountText(usedUsd)}）：从已登录浏览器导出 Cookie 存入 DATA_DIR/${config.provider}-cookie.txt，或在控制台生成访问令牌存入 ${accessTokenEnvOf(config.apiKeyEnv)}`
+    const attempt = async (headers: Record<string, string>): Promise<number | undefined> => {
+      const self = await probeJsonWithRetry(`${origin}/api/user/self`, headers, { timeoutMs: 15_000, retries: 1 })
+      const data = self['data'] as Record<string, unknown> | undefined
+      return data !== undefined ? numField(data, 'quota') : undefined
+    }
+    // ① 控制台会话 Cookie（可经浏览器桥，桥的同源 fetch 自动携带会话）
+    const session = readConsoleSession(config.provider)
+    let consoleError: unknown
+    if (session !== undefined) {
+      const headers: Record<string, string> = { cookie: session.cookie, accept: 'application/json' }
+      if (session.newApiUser !== undefined) headers['new-api-user'] = session.newApiUser
+      try {
+        const quotaRaw = await attempt(headers)
+        if (quotaRaw !== undefined) {
+          return {
+            channel: config.provider,
+            kind: 'balance',
+            displayName: config.displayName,
+            balance: amountText(quotaRaw / NEWAPI_QUOTA_PER_UNIT),
+            currency: 'USD',
+            note: `用户余额（控制台会话）· 已用 $${amountText(usedUsd)}`,
+            fetchedAt: now,
+          }
+        }
+      } catch (e) {
+        // 会话失效（过期/被顶掉）或上游网络故障——落到访问令牌或提示。
+        consoleError = e
+      }
+    }
+    // ② 访问令牌（控制台「生成访问令牌」）
+    const accessToken = await resolveKey(accessTokenEnvOf(config.apiKeyEnv))
+    if (accessToken !== undefined) {
+      try {
+        const quotaRaw = await attempt({ authorization: `Bearer ${accessToken}`, accept: 'application/json' })
+        if (quotaRaw !== undefined) {
+          return {
+            channel: config.provider,
+            kind: 'balance',
+            displayName: config.displayName,
+            balance: amountText(quotaRaw / NEWAPI_QUOTA_PER_UNIT),
+            currency: 'USD',
+            note: `用户余额（访问令牌）· 已用 $${amountText(usedUsd)}`,
+            fetchedAt: now,
+          }
+        }
+      } catch (e) {
+        consoleError = e
+      }
+    }
+    if (consoleError !== undefined && isNetworkProbeError(consoleError)) {
+      // 网络级失败要如实报告——「会话已失效」的指引只会误导。
+      return {
+        channel: config.provider,
+        kind: 'manual',
+        displayName: config.displayName,
+        error: `上游查询失败：${consoleError instanceof Error ? consoleError.message : String(consoleError)}`,
+      }
+    }
+    return {
+      channel: config.provider,
+      kind: 'manual',
+      displayName: config.displayName,
+      note: session !== undefined
+        ? `控制台会话已失效，请重新导出 Cookie 更新 DATA_DIR/${config.provider}-cookie.txt（已用 $${amountText(usedUsd)}）`
+        : hint,
+    }
+  }
+
+  return {
+    channel: config.provider,
+    kind: 'balance',
+    displayName: config.displayName,
+    balance: amountText(totalUsd - usedUsd),
+    currency: 'USD',
+    note: `NewAPI 额度 $${amountText(totalUsd)} · 已用 $${amountText(usedUsd)}`,
+    fetchedAt: now,
+  }
+}
+
+/** Sub2API 系网关（mdkj.lol 等）：`GET <base>/usage` 用 sk key 自查余额与用量。 */
+async function probeSub2ApiUsage(
+  config: ProviderConfig,
+  base: string,
+  key: string,
+  now: number,
+  diag: { note?: string } = {},
+): Promise<ChannelBalance | undefined> {
+  let body: Record<string, unknown>
+  try {
+    body = await probeJsonWithRetry(`${base}/usage`, { authorization: `Bearer ${key}` }, { timeoutMs: 20_000, retries: 1 })
+  } catch (e) {
+    if (isNetworkProbeError(e)) diag.note = `上游查询失败：${e instanceof Error ? e.message : String(e)}`
+    return undefined
+  }
+  const remaining = numField(body, 'remaining') ?? numField(body, 'balance')
+  if (remaining === undefined) return undefined
+  const unitRaw = typeof body['unit'] === 'string' ? body['unit'] as string : 'USD'
+  const noteParts: string[] = []
+  if (typeof body['planName'] === 'string' && body['planName'] !== '') noteParts.push(body['planName'] as string)
+  const usage = body['usage'] as Record<string, unknown> | undefined
+  const today = usage?.['today'] as Record<string, unknown> | undefined
+  const total = usage?.['total'] as Record<string, unknown> | undefined
+  if (today !== undefined) {
+    const tok = numField(today, 'total_tokens')
+    const reqs = numField(today, 'requests')
+    if (tok !== undefined) noteParts.push(`今日 ${tokensShort(tok)} tok / ${reqs ?? 0} 次`)
+  }
+  if (total !== undefined) {
+    const cost = numField(total, 'actual_cost') ?? numField(total, 'cost')
+    if (cost !== undefined) noteParts.push(`累计成本 $${amountText(cost)}`)
+  }
+  return {
+    channel: config.provider,
+    kind: 'balance',
+    displayName: config.displayName,
+    balance: amountText(remaining),
+    currency: unitRaw === 'CNY' ? 'CNY' : 'USD',
+    note: noteParts.length > 0 ? noteParts.join(' · ') : undefined,
+    fetchedAt: now,
+  }
 }
 
 /**
@@ -277,6 +686,60 @@ async function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (n
     push('滚动', usage?.['rolling'])
     push('7天', usage?.['weekly'])
     push('30天', usage?.['monthly'])
+    return { channel: config.provider, kind: 'plan', displayName: config.displayName, quota, fetchedAt: now }
+  }
+
+  if (config.provider === 'mimo' || url.includes('token-plan-cn.xiaomimimo.com')) {
+    // MiMo Token Plan 平台控制台接口：需要登录 Cookie（无公开匿名 API）。
+    // Cookie 从环境变量 MIMO_PLATFORM_COOKIE 或 ~/.dsh/stats-panel/mimo-cookie.txt 读取。
+    const cookie = readMimoCookie()
+    if (cookie === undefined) {
+      return { channel: config.provider, kind: 'manual', displayName: config.displayName }
+    }
+    let body: Record<string, unknown>
+    try {
+      body = await probeJsonWithRetry('https://platform.xiaomimimo.com/api/v1/tokenPlan/usage', {
+        cookie,
+        accept: 'application/json, text/plain, */*',
+        origin: 'https://platform.xiaomimimo.com',
+        referer: 'https://platform.xiaomimimo.com/console/plan-manage',
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      }, { timeoutMs: 20_000, retries: 1 })
+    } catch (e) {
+      if (e instanceof Error && /^HTTP 401$/.test(e.message)) {
+        return {
+          channel: config.provider,
+          kind: 'plan',
+          displayName: config.displayName,
+          error: 'MiMo 登录已过期，请重新登录 platform.xiaomimimo.com 并更新 Cookie（~/.dsh/stats-panel/mimo-cookie.txt）',
+          fetchedAt: now,
+        }
+      }
+      throw e
+    }
+    const data = body['data'] as Record<string, unknown> | undefined
+    // 官网 plan-manage 只展示一个主要已使用量；这里取总套餐（plan_total_token）作为唯一主项，
+    // 过滤 compensation（limit=0）等无效项，避免卡片挤在一起。
+    const usage = data?.['usage'] as Record<string, unknown> | undefined
+    const items = usage?.['items'] as Array<Record<string, unknown>> | undefined
+    const quota: Array<{ label: string; percent: number; resetsAt: string; used?: number; limit?: number }> = []
+    const labelOf = (name: string): string => name === 'plan_total_token' ? '总套餐' : name === 'month_total_token' ? '本月' : name
+    const primary = (Array.isArray(items) ? items : []).find((item) => {
+      if (typeof item !== 'object' || item === null) return false
+      const name = typeof item['name'] === 'string' ? String(item['name']) : ''
+      const limit = numField(item, 'limit')
+      return name === 'plan_total_token' || (limit !== undefined && limit > 0)
+    })
+    if (primary !== undefined && typeof primary === 'object' && primary !== null) {
+      quota.push({
+        label: labelOf(typeof primary['name'] === 'string' ? String(primary['name']) : '总套餐'),
+        percent: (numField(primary, 'percent') ?? 0) * 100,
+        resetsAt: '',
+        used: numField(primary, 'used'),
+        limit: numField(primary, 'limit'),
+      })
+    }
+    if (quota.length === 0) throw new Error('MiMo 平台未返回套餐用量')
     return { channel: config.provider, kind: 'plan', displayName: config.displayName, quota, fetchedAt: now }
   }
 
@@ -438,24 +901,291 @@ async function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (n
     return { channel: config.provider, kind: 'plan', displayName: config.displayName, usage, fetchedAt: now }
   }
 
+  // 通用中转站兜底：NewAPI / one-api 计费模拟端点（AgentRouter 等本地桥或
+  // 直连均可）→ Sub2API 网关 key 自查（mdkj.lol 等）→ 手动填写。
+  if (base !== '') {
+    const key = await resolveKey(config.apiKeyEnv)
+    if (key !== undefined) {
+      const diag: { note?: string } = {}
+      const newApi = await probeNewApiBilling(config, base, key, now, resolveKey, diag)
+      if (newApi !== undefined) return newApi
+      const sub2api = await probeSub2ApiUsage(config, base, key, now, diag)
+      if (sub2api !== undefined) return sub2api
+      // Bare manual means "no known API"; a diag error means the upstream was
+      // unreachable — report the failure instead of pretending the channel is
+      // merely unconfigured (auto-recovers on the next successful probe).
+      if (diag.note !== undefined) {
+        return { channel: config.provider, kind: 'manual', displayName: config.displayName, error: diag.note }
+      }
+    }
+  }
+
   // No public API: the browser half lets the user enter the status manually.
   return { channel: config.provider, kind: 'manual', displayName: config.displayName }
 }
 
-/** Load the durable usage log (best effort). Records without a seq (pre-fix data) are dropped. */
-function loadRecords(): UsageRecord[] {
+/** Runtime validation for persisted numeric fields. Token counts are integral and non-negative. */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+const MAX_DATE_MS = 8_640_000_000_000_000
+
+function isValidTimestamp(value: unknown): value is number {
+  return isNonNegativeSafeInteger(value) && value <= MAX_DATE_MS
+}
+
+function objectOf(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function labelOrUnknown(value: unknown): string {
+  if (typeof value !== 'string') return 'unknown'
+  const label = value.trim()
+  return label === '' ? 'unknown' : label
+}
+
+/** Optional fields from older records default to zero; present invalid fields fail closed. */
+function countField(object: Record<string, unknown>, field: string, optional = false): number | null {
+  if (object[field] === undefined && optional) return 0
+  return isNonNegativeSafeInteger(object[field]) ? object[field] : null
+}
+
+function tokenTotal(inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheWriteTokens: number): number {
+  return inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+}
+
+function tokenTotalOrNull(inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheWriteTokens: number): number | null {
+  const total = tokenTotal(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
+  return isNonNegativeSafeInteger(total) ? total : null
+}
+
+interface UsageCounters {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+}
+
+interface AggregateCounters extends UsageCounters {
+  calls: number
+}
+
+const AGGREGATE_COUNTER_KEYS: readonly (keyof AggregateCounters)[] = [
+  'calls', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens',
+]
+
+function sumAggregateRows(rows: readonly AggregateCounters[]): AggregateCounters | null {
+  const sum: AggregateCounters = {
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+  }
+  for (const row of rows) {
+    for (const key of AGGREGATE_COUNTER_KEYS) {
+      const next = sum[key] + row[key]
+      if (!isNonNegativeSafeInteger(next)) return null
+      sum[key] = next
+    }
+  }
+  return sum
+}
+
+function sameAggregateCounters(left: AggregateCounters, right: AggregateCounters): boolean {
+  return AGGREGATE_COUNTER_KEYS.every(key => left[key] === right[key])
+}
+
+function normalizeUsageCounters(value: unknown): UsageCounters | null {
+  const object = objectOf(value)
+  if (object === null) return null
+  const inputTokens = countField(object, 'inputTokens')
+  const outputTokens = countField(object, 'outputTokens')
+  const cacheReadTokens = countField(object, 'cacheReadTokens', true)
+  const cacheWriteTokens = countField(object, 'cacheWriteTokens', true)
+  const reasoningTokens = countField(object, 'reasoningTokens', true)
+  if (inputTokens === null || outputTokens === null || cacheReadTokens === null
+    || cacheWriteTokens === null || reasoningTokens === null) return null
+  if (tokenTotalOrNull(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) === null) return null
+  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }
+}
+
+/** Normalize one record while preserving old rows that omitted optional counters. */
+function normalizeUsageRecord(value: unknown): UsageRecord | null {
+  const object = objectOf(value)
+  if (object === null
+    || !isValidTimestamp(object.ts)
+    || !isNonNegativeSafeInteger(object.seq)
+    || typeof object.sessionId !== 'string'
+    || object.sessionId.trim() === ''
+    || typeof object.model !== 'string'
+    || typeof object.provider !== 'string') return null
+  const counters = normalizeUsageCounters(object)
+  if (counters === null) return null
+  return {
+    ts: object.ts,
+    seq: object.seq,
+    sessionId: object.sessionId,
+    model: labelOrUnknown(object.model),
+    provider: labelOrUnknown(object.provider),
+    ...counters,
+  }
+}
+
+function normalizeModelStats(value: unknown): ModelStats | null {
+  const object = objectOf(value)
+  if (object === null || typeof object.model !== 'string') return null
+  const calls = countField(object, 'calls')
+  const inputTokens = countField(object, 'inputTokens')
+  const outputTokens = countField(object, 'outputTokens')
+  const cacheReadTokens = countField(object, 'cacheReadTokens', true)
+  const cacheWriteTokens = countField(object, 'cacheWriteTokens', true)
+  const reasoningTokens = countField(object, 'reasoningTokens', true)
+  if (calls === null || inputTokens === null || outputTokens === null || cacheReadTokens === null
+    || cacheWriteTokens === null || reasoningTokens === null) return null
+  const totalTokens = tokenTotalOrNull(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
+  if (totalTokens === null) return null
+  return {
+    model: labelOrUnknown(object.model),
+    calls,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+    totalTokens,
+  }
+}
+
+function normalizeChannelStats(value: unknown): ChannelStats | null {
+  const object = objectOf(value)
+  if (object === null || typeof object.channel !== 'string' || !Array.isArray(object.models)
+    || !object.models.every(model => typeof model === 'string')) return null
+  const calls = countField(object, 'calls')
+  const inputTokens = countField(object, 'inputTokens')
+  const outputTokens = countField(object, 'outputTokens')
+  const cacheReadTokens = countField(object, 'cacheReadTokens', true)
+  const cacheWriteTokens = countField(object, 'cacheWriteTokens', true)
+  const reasoningTokens = countField(object, 'reasoningTokens', true)
+  if (calls === null || inputTokens === null || outputTokens === null || cacheReadTokens === null
+    || cacheWriteTokens === null || reasoningTokens === null) return null
+  const totalTokens = tokenTotalOrNull(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
+  if (totalTokens === null) return null
+  return {
+    channel: labelOrUnknown(object.channel),
+    models: object.models.map(model => labelOrUnknown(model)),
+    calls,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+    totalTokens,
+  }
+}
+
+function normalizeBucket(value: unknown): DailyStats | null {
+  const object = objectOf(value)
+  if (object === null) return null
+  const rawDate = typeof object.date === 'string' ? object.date : object.period
+  if (typeof rawDate !== 'string' || rawDate.trim() === '') return null
+  const date = rawDate.trim()
+  const rawPeriod = object.period === undefined ? date : object.period
+  if (typeof rawPeriod !== 'string' || rawPeriod.trim() === '') return null
+  const period = rawPeriod.trim()
+  if (period !== date) return null
+  const calls = countField(object, 'calls')
+  const inputTokens = countField(object, 'inputTokens')
+  const outputTokens = countField(object, 'outputTokens')
+  const cacheReadTokens = countField(object, 'cacheReadTokens', true)
+  const cacheWriteTokens = countField(object, 'cacheWriteTokens', true)
+  const reasoningTokens = countField(object, 'reasoningTokens', true)
+  if (calls === null || inputTokens === null || outputTokens === null || cacheReadTokens === null
+    || cacheWriteTokens === null || reasoningTokens === null) return null
+  const totalTokens = tokenTotalOrNull(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
+  if (totalTokens === null) return null
+  return {
+    date,
+    period,
+    calls,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+    totalTokens,
+  }
+}
+
+function normalizeAggregate(value: unknown): UsageAggregate | null {
+  const object = objectOf(value)
+  const totalsObject = object === null ? null : objectOf(object.totals)
+  if (object === null || totalsObject === null || !Array.isArray(object.modelStats)
+    || !Array.isArray(object.channelStats) || !Array.isArray(object.dailyStats)) return null
+  const calls = countField(totalsObject, 'calls')
+  const inputTokens = countField(totalsObject, 'inputTokens')
+  const outputTokens = countField(totalsObject, 'outputTokens')
+  const cacheReadTokens = countField(totalsObject, 'cacheReadTokens', true)
+  const cacheWriteTokens = countField(totalsObject, 'cacheWriteTokens', true)
+  const reasoningTokens = countField(totalsObject, 'reasoningTokens', true)
+  const modelStats = object.modelStats.map(normalizeModelStats)
+  const channelStats = object.channelStats.map(normalizeChannelStats)
+  const dailyStats = object.dailyStats.map(normalizeBucket)
+  const hasWeeklyStats = object.weeklyStats !== undefined
+  const hasMonthlyStats = object.monthlyStats !== undefined
+  const weeklyStats = (hasWeeklyStats ? object.weeklyStats : []) as unknown
+  const monthlyStats = (hasMonthlyStats ? object.monthlyStats : []) as unknown
+  if (calls === null || inputTokens === null || outputTokens === null || cacheReadTokens === null
+    || cacheWriteTokens === null || reasoningTokens === null
+    || modelStats.some(value => value === null) || channelStats.some(value => value === null)
+    || dailyStats.some(value => value === null) || !Array.isArray(weeklyStats)
+    || !Array.isArray(monthlyStats)) return null
+  const normalizedWeekly = weeklyStats.map(normalizeBucket)
+  const normalizedMonthly = monthlyStats.map(normalizeBucket)
+  if (normalizedWeekly.some(value => value === null) || normalizedMonthly.some(value => value === null)) return null
+  const normalizedModel = modelStats as ModelStats[]
+  const normalizedChannel = channelStats as ChannelStats[]
+  const normalizedDaily = dailyStats as DailyStats[]
+  const normalizedWeeklyStats = normalizedWeekly as DailyStats[]
+  const normalizedMonthlyStats = normalizedMonthly as DailyStats[]
+  const totals: AggregateCounters = { calls, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }
+  const dimensions: Array<readonly AggregateCounters[]> = [normalizedModel, normalizedChannel, normalizedDaily]
+  if (hasWeeklyStats) dimensions.push(normalizedWeeklyStats)
+  if (hasMonthlyStats) dimensions.push(normalizedMonthlyStats)
+  if (dimensions.some(rows => {
+    const sum = sumAggregateRows(rows)
+    return sum === null || !sameAggregateCounters(sum, totals)
+  })) return null
+  return {
+    totals: { calls, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens },
+    modelStats: modelStats as ModelStats[],
+    channelStats: channelStats as ChannelStats[],
+    dailyStats: dailyStats as DailyStats[],
+    weeklyStats: normalizedWeekly as DailyStats[],
+    monthlyStats: normalizedMonthly as DailyStats[],
+  }
+}
+
+/** Load and normalize the durable usage log; malformed rows are ignored. */
+function loadRecords(cutoffTs?: number): UsageRecord[] {
   try {
     if (!existsSync(RECORDS_FILE)) return []
     const lines = readFileSync(RECORDS_FILE, 'utf8').split('\n').filter(line => line.trim() !== '')
     const records: UsageRecord[] = []
+    const loadedKeys = new Set<string>()
     for (const line of lines) {
       try {
-        const parsed = JSON.parse(line) as UsageRecord
-        if (typeof parsed === 'object' && parsed !== null
-          && typeof parsed.ts === 'number'
-          && typeof parsed.seq === 'number'
-          && typeof parsed.sessionId === 'string') {
-          records.push(parsed)
+        const record = normalizeUsageRecord(JSON.parse(line))
+        if (record !== null && (cutoffTs === undefined || record.ts >= cutoffTs)) {
+          const key = `${record.sessionId}:${record.seq}`
+          if (loadedKeys.has(key)) continue
+          loadedKeys.add(key)
+          records.push(record)
         }
       } catch {
         // Skip corrupt lines.
@@ -476,120 +1206,370 @@ function appendRecord(record: UsageRecord): void {
   }
 }
 
-/** Compute the summary aggregates. */
-export function computeSummary(records: readonly UsageRecord[]): StatsSummary {
-  let totalCalls = 0
-  let totalInputTokens = 0
-  let totalOutputTokens = 0
-  let totalCacheReadTokens = 0
-  let totalCacheWriteTokens = 0
-  let totalReasoningTokens = 0
+/** Write via a process-unique tmp+rename so crashes cannot truncate the target. */
+let atomicWriteId = 0
+function writeFileAtomic(path: string, data: string): void {
+  const tmp = `${path}.${process.pid}.${++atomicWriteId}.tmp`
+  writeFileSync(tmp, data)
+  renameSync(tmp, path)
+}
 
-  const modelMap = new Map<string, ModelStats>()
-  const channelMap = new Map<string, ChannelStats>()
-  const dailyMap = new Map<string, DailyStats>()
+/** Archived aggregates for the detail prefix below `cutoffTs`. */
+interface ArchiveFile {
+  version: 1
+  /** Detail records with `ts < cutoffTs` are folded into `aggregate`. */
+  cutoffTs: number
+  aggregate: UsageAggregate
+}
 
-  for (const record of records) {
-    totalCalls++
-    totalInputTokens += record.inputTokens
-    totalOutputTokens += record.outputTokens
-    totalCacheReadTokens += record.cacheReadTokens
-    totalCacheWriteTokens += record.cacheWriteTokens
-    totalReasoningTokens += record.reasoningTokens
-    const recordTotal = record.inputTokens + record.outputTokens + record.cacheReadTokens + record.cacheWriteTokens
-
-    const existing = modelMap.get(record.model)
-    if (existing !== undefined) {
-      existing.calls++
-      existing.inputTokens += record.inputTokens
-      existing.outputTokens += record.outputTokens
-      existing.cacheReadTokens += record.cacheReadTokens
-      existing.cacheWriteTokens += record.cacheWriteTokens
-      existing.reasoningTokens += record.reasoningTokens
-      existing.totalTokens += recordTotal
-    } else {
-      modelMap.set(record.model, {
-        model: record.model,
-        calls: 1,
-        inputTokens: record.inputTokens,
-        outputTokens: record.outputTokens,
-        cacheReadTokens: record.cacheReadTokens,
-        cacheWriteTokens: record.cacheWriteTokens,
-        reasoningTokens: record.reasoningTokens,
-        totalTokens: recordTotal,
-      })
-    }
-
-    const channel = record.provider === '' ? 'unknown' : record.provider
-    const channelEntry = channelMap.get(channel)
-    if (channelEntry !== undefined) {
-      channelEntry.calls++
-      channelEntry.inputTokens += record.inputTokens
-      channelEntry.outputTokens += record.outputTokens
-      channelEntry.cacheReadTokens += record.cacheReadTokens
-      channelEntry.cacheWriteTokens += record.cacheWriteTokens
-      channelEntry.reasoningTokens += record.reasoningTokens
-      channelEntry.totalTokens += recordTotal
-      if (!channelEntry.models.includes(record.model)) channelEntry.models.push(record.model)
-    } else {
-      channelMap.set(channel, {
-        channel,
-        models: [record.model],
-        calls: 1,
-        inputTokens: record.inputTokens,
-        outputTokens: record.outputTokens,
-        cacheReadTokens: record.cacheReadTokens,
-        cacheWriteTokens: record.cacheWriteTokens,
-        reasoningTokens: record.reasoningTokens,
-        totalTokens: recordTotal,
-      })
-    }
-
-    const date = new Date(record.ts).toISOString().slice(0, 10)
-    const day = dailyMap.get(date)
-    if (day !== undefined) {
-      day.calls++
-      day.inputTokens += record.inputTokens
-      day.outputTokens += record.outputTokens
-      day.cacheReadTokens += record.cacheReadTokens
-      day.cacheWriteTokens += record.cacheWriteTokens
-      day.totalTokens += recordTotal
-    } else {
-      dailyMap.set(date, {
-        date,
-        calls: 1,
-        inputTokens: record.inputTokens,
-        outputTokens: record.outputTokens,
-        cacheReadTokens: record.cacheReadTokens,
-        cacheWriteTokens: record.cacheWriteTokens,
-        totalTokens: recordTotal,
-      })
-    }
-  }
-
-  const totalTokens = totalInputTokens + totalOutputTokens + totalCacheReadTokens + totalCacheWriteTokens
-  const cacheHitRate = totalTokens > 0 ? ((totalCacheReadTokens + totalCacheWriteTokens) / totalTokens) * 100 : 0
-
-  return {
-    totalCalls,
-    totalInputTokens,
-    totalOutputTokens,
-    totalCacheReadTokens,
-    totalCacheWriteTokens,
-    totalReasoningTokens,
-    totalTokens,
-    cacheHitRate,
-    modelStats: Array.from(modelMap.values()),
-    channelStats: Array.from(channelMap.values()).sort((a, b) => b.totalTokens - a.totalTokens),
-    dailyStats: Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
-    recentRecords: records.slice(-100).reverse(),
+function loadArchive(): ArchiveFile | null {
+  try {
+    if (!existsSync(ARCHIVE_FILE)) return null
+    const parsed = JSON.parse(readFileSync(ARCHIVE_FILE, 'utf8')) as Record<string, unknown>
+    if (parsed?.['version'] !== 1 || !isValidTimestamp(parsed['cutoffTs'])) return null
+    const aggregate = normalizeAggregate(parsed['aggregate'])
+    if (aggregate === null) return null
+    return { version: 1, cutoffTs: parsed['cutoffTs'], aggregate }
+  } catch {
+    return null
   }
 }
 
-/** Small TTL cache for the balances route (see CACHE_TTL_MS). */
-const balancesCache = { value: undefined as { at: number; balances: ChannelBalance[] } | undefined,
-  get() { return this.value },
-  set(balances: ChannelBalance[]) { this.value = { at: Date.now(), balances } },
+/** Revision-indexed backfill state; old boolean state is intentionally invalidated. */
+interface BackfillState {
+  version: 2
+  revisions: Record<string, string>
+  /** Diagnostic only; revision comparison is the correctness source. */
+  recordsAtWrite: number
+}
+
+function loadBackfillState(): BackfillState | null {
+  try {
+    if (existsSync(BACKFILL_STATE_FILE)) {
+      const parsed = JSON.parse(readFileSync(BACKFILL_STATE_FILE, 'utf8')) as Record<string, unknown>
+      const revisions = parsed['revisions']
+      if (parsed?.['version'] === 2 && objectOf(revisions) !== null
+        && Object.values(revisions as Record<string, unknown>).every(value => typeof value === 'string')
+        && isNonNegativeSafeInteger(parsed['recordsAtWrite'])) {
+        return {
+          version: 2,
+          revisions: revisions as Record<string, string>,
+          recordsAtWrite: parsed['recordsAtWrite'],
+        }
+      }
+    }
+  } catch {
+    // Fall through to a full resweep.
+  }
+  return null
+}
+
+/** `YYYY-MM-DD` — the original daily key. */
+function dayKey(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10)
+}
+
+/** `YYYY-MM` — calendar month. */
+function monthKey(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 7)
+}
+
+/**
+ * `YYYY-Www` — ISO-8601 week (Monday-based; week 01 holds the year's first
+ * Thursday). Computed on a UTC copy so the Thursday shift cannot roll across a
+ * DST boundary, and keyed by the ISO week-numbering year, which is why a date
+ * like 2027-01-01 correctly reports `2026-W53`.
+ */
+function isoWeekKey(ts: number): string {
+  const date = new Date(ts)
+  const shifted = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
+  // Monday = 0 … Sunday = 6, then jump to that week's Thursday.
+  shifted.setUTCDate(shifted.getUTCDate() - ((shifted.getUTCDay() + 6) % 7) + 3)
+  const firstThursday = new Date(Date.UTC(shifted.getUTCFullYear(), 0, 4))
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - ((firstThursday.getUTCDay() + 6) % 7) + 3)
+  const week = 1 + Math.round((shifted.getTime() - firstThursday.getTime()) / (7 * 864e5))
+  return `${shifted.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+}
+
+/**
+ * Fold one record into a period bucket, creating it on first sight. Shared by
+ * the day/week/month maps so the three periods can never drift in which token
+ * classes they count.
+ */
+function accumulateBucket(
+  map: Map<string, DailyStats>,
+  period: string,
+  record: UsageRecord,
+  recordTotal: number,
+): void {
+  const bucket = map.get(period)
+  if (bucket !== undefined) {
+    bucket.calls++
+    bucket.inputTokens += record.inputTokens
+    bucket.outputTokens += record.outputTokens
+    bucket.cacheReadTokens += record.cacheReadTokens
+    bucket.cacheWriteTokens += record.cacheWriteTokens
+    bucket.reasoningTokens += record.reasoningTokens
+    bucket.totalTokens += recordTotal
+    return
+  }
+  map.set(period, {
+    date: period,
+    period,
+    calls: 1,
+    inputTokens: record.inputTokens,
+    outputTokens: record.outputTokens,
+    cacheReadTokens: record.cacheReadTokens,
+    cacheWriteTokens: record.cacheWriteTokens,
+    reasoningTokens: record.reasoningTokens,
+    totalTokens: recordTotal,
+  })
+}
+
+/** Running fold state — the mutable accumulators behind the summary. */
+interface FoldState {
+  totals: {
+    calls: number
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens: number
+    cacheWriteTokens: number
+    reasoningTokens: number
+  }
+  modelMap: Map<string, ModelStats>
+  channelMap: Map<string, ChannelStats>
+  dailyMap: Map<string, DailyStats>
+  weeklyMap: Map<string, DailyStats>
+  monthlyMap: Map<string, DailyStats>
+}
+
+/**
+ * Aggregates over a record range, serializable. This is what the compaction
+ * step persists for records past the detail-retention window; feeding it back
+ * into {@link computeSummary} keeps every total exact.
+ */
+export interface UsageAggregate {
+  totals: FoldState['totals']
+  modelStats: ModelStats[]
+  channelStats: ChannelStats[]
+  dailyStats: DailyStats[]
+  weeklyStats: DailyStats[]
+  monthlyStats: DailyStats[]
+}
+
+function newFold(): FoldState {
+  return {
+    totals: { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 },
+    modelMap: new Map(),
+    channelMap: new Map(),
+    dailyMap: new Map(),
+    weeklyMap: new Map(),
+    monthlyMap: new Map(),
+  }
+}
+
+/** Fold one record into the accumulators. */
+function foldRecord(fold: FoldState, record: UsageRecord): void {
+  const totals = fold.totals
+  totals.calls++
+  totals.inputTokens += record.inputTokens
+  totals.outputTokens += record.outputTokens
+  totals.cacheReadTokens += record.cacheReadTokens
+  totals.cacheWriteTokens += record.cacheWriteTokens
+  totals.reasoningTokens += record.reasoningTokens
+  const recordTotal = record.inputTokens + record.outputTokens + record.cacheReadTokens + record.cacheWriteTokens
+
+  const existing = fold.modelMap.get(record.model)
+  if (existing !== undefined) {
+    existing.calls++
+    existing.inputTokens += record.inputTokens
+    existing.outputTokens += record.outputTokens
+    existing.cacheReadTokens += record.cacheReadTokens
+    existing.cacheWriteTokens += record.cacheWriteTokens
+    existing.reasoningTokens += record.reasoningTokens
+    existing.totalTokens += recordTotal
+  } else {
+    fold.modelMap.set(record.model, {
+      model: record.model,
+      calls: 1,
+      inputTokens: record.inputTokens,
+      outputTokens: record.outputTokens,
+      cacheReadTokens: record.cacheReadTokens,
+      cacheWriteTokens: record.cacheWriteTokens,
+      reasoningTokens: record.reasoningTokens,
+      totalTokens: recordTotal,
+    })
+  }
+
+  const channel = record.provider === '' ? 'unknown' : record.provider
+  const channelEntry = fold.channelMap.get(channel)
+  if (channelEntry !== undefined) {
+    channelEntry.calls++
+    channelEntry.inputTokens += record.inputTokens
+    channelEntry.outputTokens += record.outputTokens
+    channelEntry.cacheReadTokens += record.cacheReadTokens
+    channelEntry.cacheWriteTokens += record.cacheWriteTokens
+    channelEntry.reasoningTokens += record.reasoningTokens
+    channelEntry.totalTokens += recordTotal
+    if (!channelEntry.models.includes(record.model)) channelEntry.models.push(record.model)
+  } else {
+    fold.channelMap.set(channel, {
+      channel,
+      models: [record.model],
+      calls: 1,
+      inputTokens: record.inputTokens,
+      outputTokens: record.outputTokens,
+      cacheReadTokens: record.cacheReadTokens,
+      cacheWriteTokens: record.cacheWriteTokens,
+      reasoningTokens: record.reasoningTokens,
+      totalTokens: recordTotal,
+    })
+  }
+
+  accumulateBucket(fold.dailyMap, dayKey(record.ts), record, recordTotal)
+  accumulateBucket(fold.weeklyMap, isoWeekKey(record.ts), record, recordTotal)
+  accumulateBucket(fold.monthlyMap, monthKey(record.ts), record, recordTotal)
+}
+
+/** Fold an already-aggregated range (archive) into the accumulators. */
+function foldAggregate(fold: FoldState, aggregate: UsageAggregate): void {
+  const totals = fold.totals
+  totals.calls += aggregate.totals.calls
+  totals.inputTokens += aggregate.totals.inputTokens
+  totals.outputTokens += aggregate.totals.outputTokens
+  totals.cacheReadTokens += aggregate.totals.cacheReadTokens
+  totals.cacheWriteTokens += aggregate.totals.cacheWriteTokens
+  totals.reasoningTokens += aggregate.totals.reasoningTokens
+
+  for (const model of aggregate.modelStats) {
+    const existing = fold.modelMap.get(model.model)
+    if (existing === undefined) {
+      fold.modelMap.set(model.model, { ...model })
+      continue
+    }
+    existing.calls += model.calls
+    existing.inputTokens += model.inputTokens
+    existing.outputTokens += model.outputTokens
+    existing.cacheReadTokens += model.cacheReadTokens
+    existing.cacheWriteTokens += model.cacheWriteTokens
+    existing.reasoningTokens += model.reasoningTokens
+    existing.totalTokens += model.totalTokens
+  }
+
+  for (const channel of aggregate.channelStats) {
+    const existing = fold.channelMap.get(channel.channel)
+    if (existing === undefined) {
+      fold.channelMap.set(channel.channel, { ...channel, models: [...channel.models] })
+      continue
+    }
+    existing.calls += channel.calls
+    existing.inputTokens += channel.inputTokens
+    existing.outputTokens += channel.outputTokens
+    existing.cacheReadTokens += channel.cacheReadTokens
+    existing.cacheWriteTokens += channel.cacheWriteTokens
+    existing.reasoningTokens += channel.reasoningTokens
+    existing.totalTokens += channel.totalTokens
+    for (const model of channel.models) {
+      if (!existing.models.includes(model)) existing.models.push(model)
+    }
+  }
+
+  // Buckets carry identical keys on both sides — fold them as plain rows.
+  for (const key of ['dailyStats', 'weeklyStats', 'monthlyStats'] as const) {
+    const target = key === 'dailyStats' ? fold.dailyMap : key === 'weeklyStats' ? fold.weeklyMap : fold.monthlyMap
+    for (const bucket of aggregate[key]) {
+      const existing = target.get(bucket.period)
+      if (existing === undefined) {
+        target.set(bucket.period, { ...bucket })
+        continue
+      }
+      existing.calls += bucket.calls
+      existing.inputTokens += bucket.inputTokens
+      existing.outputTokens += bucket.outputTokens
+      existing.cacheReadTokens += bucket.cacheReadTokens
+      existing.cacheWriteTokens += bucket.cacheWriteTokens
+      existing.reasoningTokens += bucket.reasoningTokens
+      existing.totalTokens += bucket.totalTokens
+    }
+  }
+}
+
+/** Aggregates over a record range (the compaction payload). */
+export function aggregateOf(records: readonly UsageRecord[]): UsageAggregate {
+  const fold = newFold()
+  for (const record of records) foldRecord(fold, record)
+  return foldToAggregate(fold)
+}
+
+function foldToAggregate(fold: FoldState): UsageAggregate {
+  return {
+    totals: { ...fold.totals },
+    modelStats: Array.from(fold.modelMap.values()),
+    channelStats: Array.from(fold.channelMap.values()),
+    dailyStats: Array.from(fold.dailyMap.values()),
+    weeklyStats: Array.from(fold.weeklyMap.values()),
+    monthlyStats: Array.from(fold.monthlyMap.values()),
+  }
+}
+
+/** Merge two aggregates (e.g. an existing archive with a newly archived range). */
+export function mergeAggregates(a: UsageAggregate, b: UsageAggregate): UsageAggregate {
+  const fold = newFold()
+  foldAggregate(fold, a)
+  foldAggregate(fold, b)
+  return foldToAggregate(fold)
+}
+
+/**
+ * Fold the stable, eligible prefix of the detail log into an archive aggregate.
+ * Rows at or after `cutoffTs` remain in the detail file, so future timestamps
+ * and records arriving after the snapshot are not silently discarded.
+ * @returns the archive payload and retained detail rows, or `null` when no row is eligible.
+ */
+export function compactRecords(
+  records: readonly UsageRecord[],
+  now: number,
+): { cutoffTs: number; aggregate: UsageAggregate; retained: UsageRecord[] } | null {
+  if (records.length === 0 || !isValidTimestamp(now)) return null
+  const compactable = records.filter(record => record.ts < now)
+  if (compactable.length === 0) return null
+  return {
+    cutoffTs: now,
+    aggregate: aggregateOf(compactable),
+    retained: records.filter(record => record.ts >= now),
+  }
+}
+
+/**
+ * Compute the summary aggregates: fold the detail records, optionally on top
+ * of the compacted archive aggregate, so totals stay exact across compaction.
+ */
+export function computeSummary(records: readonly UsageRecord[], archive?: UsageAggregate): StatsSummary {
+  const fold = newFold()
+  for (const record of records) foldRecord(fold, record)
+  if (archive !== undefined) foldAggregate(fold, archive)
+
+  const totalTokens = fold.totals.inputTokens + fold.totals.outputTokens + fold.totals.cacheReadTokens + fold.totals.cacheWriteTokens
+  const cacheHitRate = totalTokens > 0
+    ? ((fold.totals.cacheReadTokens + fold.totals.cacheWriteTokens) / totalTokens) * 100
+    : 0
+
+  return {
+    totalCalls: fold.totals.calls,
+    totalInputTokens: fold.totals.inputTokens,
+    totalOutputTokens: fold.totals.outputTokens,
+    totalCacheReadTokens: fold.totals.cacheReadTokens,
+    totalCacheWriteTokens: fold.totals.cacheWriteTokens,
+    totalReasoningTokens: fold.totals.reasoningTokens,
+    totalTokens,
+    cacheHitRate,
+    modelStats: Array.from(fold.modelMap.values()),
+    channelStats: Array.from(fold.channelMap.values()).sort((a, b) => b.totalTokens - a.totalTokens),
+    dailyStats: Array.from(fold.dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
+    weeklyStats: Array.from(fold.weeklyMap.values()).sort((a, b) => a.period.localeCompare(b.period)),
+    monthlyStats: Array.from(fold.monthlyMap.values()).sort((a, b) => a.period.localeCompare(b.period)),
+    recentRecords: records.slice(-100).reverse(),
+  }
 }
 
 /**
@@ -598,7 +1578,21 @@ const balancesCache = { value: undefined as { at: number; balances: ChannelBalan
  */
 export function apply(ctx: Context): void {
   mkdirSync(DATA_DIR, { recursive: true })
-  const records = loadRecords()
+  /** Per-application summary cache; never share data between remounted hosts. */
+  const summaryCache = { value: undefined as StatsSummary | undefined, dirty: true }
+  /** Per-application balance cache and probe deduplication. */
+  const balancesCache = { value: undefined as { at: number; balances: ChannelBalance[] } | undefined,
+    get() { return this.value },
+    set(balances: ChannelBalance[]) { this.value = { at: Date.now(), balances } },
+  }
+  let balancesInFlight: Promise<ChannelBalance[]> | undefined
+  // Compacted aggregates over every record already folded away. Detail rows
+  // below `cutoffTs` are ignored at load time (they may still sit in the jsonl
+  // after a partial compaction — the filter makes that crash window safe).
+  // `let` because an in-boot compaction replaces it (see the backfill task).
+  const bootArchive = loadArchive()
+  let archive: ArchiveFile | null = bootArchive
+  let records = loadRecords(bootArchive?.cutoffTs)
   // (sessionId, seq) of every event already collected — dedupes the
   // asynchronous backfill against live listeners AND against previous
   // process runs (records persisted in earlier boots carry their seq).
@@ -609,17 +1603,25 @@ export function apply(ctx: Context): void {
     }
   }
 
-  let currentModel = 'unknown'
-  let currentProvider = 'unknown'
+  // Live event feeds from different sessions may interleave. Keep the route
+  // association per session instead of sharing the last observed header.
+  const liveRoutes = new Map<string, { model: string; provider: string }>()
 
   const collect = (
-    sessionId: string,
+    sessionId: unknown,
     seq: number,
     model: string,
     provider: string,
-    usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number },
+    usage: unknown,
     ts: number,
   ): void => {
+    // Pre-cutoff events are already folded into the archive aggregate —
+    // re-collecting them (e.g. a resweep after the backfill state was lost)
+    // would double-count them at the next compaction.
+    if (typeof sessionId !== 'string' || !isNonNegativeSafeInteger(seq) || !isValidTimestamp(ts) || sessionId.trim() === '') return
+    if (archive !== null && ts < archive.cutoffTs) return
+    const counters = normalizeUsageCounters(usage)
+    if (counters === null) return
     const key = `${sessionId}:${seq}`
     if (seen.has(key)) return
     seen.add(key)
@@ -627,39 +1629,79 @@ export function apply(ctx: Context): void {
       ts,
       seq,
       sessionId,
-      model,
-      provider,
-      inputTokens: usage.inputTokens ?? 0,
-      outputTokens: usage.outputTokens ?? 0,
-      cacheReadTokens: usage.cacheReadTokens ?? 0,
-      cacheWriteTokens: usage.cacheWriteTokens ?? 0,
-      reasoningTokens: usage.reasoningTokens ?? 0,
+      model: labelOrUnknown(model),
+      provider: labelOrUnknown(provider),
+      ...counters,
     }
     records.push(record)
     appendRecord(record)
+    summaryCache.dirty = true
   }
 
   // Live collection.
   ctx.on('session/event', (session, event) => {
     if (event.type === 'request/header') {
-      currentModel = event.data.header.config.model
-      currentProvider = event.data.header.config.provider
+      liveRoutes.set(session.id, {
+        model: labelOrUnknown(event.data.header.config.model),
+        provider: labelOrUnknown(event.data.header.config.provider),
+      })
     } else if (event.type === 'assistant/message' && event.data.usage !== undefined) {
-      collect(session.id, event.seq, currentModel, currentProvider, event.data.usage, event.time)
+      const route = liveRoutes.get(session.id)
+      collect(session.id, event.seq, route?.model ?? 'unknown', route?.provider ?? 'unknown', event.data.usage, event.time)
     }
+  })
+  ctx.on('session/disposed', (session) => {
+    liveRoutes.delete(session.id)
   })
 
   // Historical backfill over persisted sessions (async, best effort, never
-  // blocks or fails the plugin).
+  // blocks or fails the plugin), followed by the retention compaction. A
+  // Persisted revisions keep repeat boots O(changed sessions) when available;
+  // unavailable revisions trigger a full sweep. Live sessions are backfilled too — the listener is
+  // registered before this runs, so `seen` dedupes the overlap and events that
+  // predate this boot are no longer lost for sessions that were live at boot.
   void (async () => {
     try {
       const query = ctx.get('sessionQuery')
       if (query === undefined) return
       const sessions = await query.listSessions()
+      const state = loadBackfillState()
+      let snapshots: Map<string, string> | null = null
+      try {
+        const persistence = ctx.get('sessionPersistence') as { listSnapshots?: () => Promise<unknown> } | undefined
+        if (typeof persistence?.listSnapshots === 'function') {
+          const listed = await persistence.listSnapshots()
+          if (Array.isArray(listed)) {
+            const next = new Map<string, string>()
+            for (const value of listed) {
+              const snapshot = objectOf(value)
+              const header = snapshot === null ? null : objectOf(snapshot['header'])
+              if (header !== null && typeof header['id'] === 'string' && typeof snapshot?.['revision'] === 'string') {
+                next.set(header['id'], snapshot['revision'])
+              }
+            }
+            snapshots = next
+          }
+        }
+      } catch {
+        // Older hosts or an unavailable persistence service fall back to a full sweep.
+        snapshots = null
+      }
+      // A shortened detail log invalidates the skip cache. After compaction,
+      // recordsAtWrite reflects the retained detail rows.
+      const stateUsable = state !== null && records.length >= state.recordsAtWrite
+      const revisions: Record<string, string> = stateUsable ? { ...state.revisions } : {}
+      let stateDirty = snapshots !== null && (state === null || !stateUsable)
+      const sessionIds = new Set<string>()
       for (const entry of sessions) {
-        if (entry.live) continue // live sessions are covered by the listener
+        const id = entry.header.id
+        sessionIds.add(id)
+        const live = (entry as { live?: unknown }).live === true
+        const revision = snapshots?.get(id)
+        // A live session may have events not yet visible to persistence; always read it.
+        if (!live && revision !== undefined && stateUsable && revisions[id] === revision) continue
         try {
-          const log = await query.readSession(entry.header.id)
+          const log = await query.readSession(id)
           let model = 'unknown'
           let provider = 'unknown'
           for (const event of log.events) {
@@ -667,11 +1709,65 @@ export function apply(ctx: Context): void {
               model = event.data.header.config.model
               provider = event.data.header.config.provider
             } else if (event.type === 'assistant/message' && event.data.usage !== undefined) {
-              collect(entry.header.id, event.seq, model, provider, event.data.usage, event.time)
+              collect(id, event.seq, model, provider, event.data.usage, event.time)
             }
           }
+          if (snapshots !== null && revision !== undefined && revisions[id] !== revision) {
+            revisions[id] = revision
+            stateDirty = true
+          }
         } catch {
-          // One bad session must not stop the sweep.
+          // One bad session must not stop the sweep; leave its revision unchanged.
+        }
+      }
+      if (snapshots !== null) {
+        for (const id of Object.keys(revisions)) {
+          if (!snapshots.has(id) && !sessionIds.has(id)) {
+            delete revisions[id]
+            stateDirty = true
+          }
+        }
+      }
+      const persistBackfillState = (): void => {
+        if (snapshots === null) return
+        try {
+          writeFileAtomic(BACKFILL_STATE_FILE, JSON.stringify({ version: 2, revisions, recordsAtWrite: records.length } satisfies BackfillState))
+        } catch {
+          // Next boot rechecks revisions — safe, just slower.
+        }
+      }
+      if (stateDirty) persistBackfillState()
+      // Retention compaction folds the eligible detail prefix into the archive
+      // and retains future/boundary rows. Order is crash-safe —
+      // loadRecords and collect() both ignore detail below `cutoffTs`, so a
+      // records rewrite that never lands cannot double-count.
+      const configuredMax = Number(process.env['DSH_STATS_COMPACT_MAX_RECORDS'])
+      const maxRecords = Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : COMPACT_MAX_RECORDS_DEFAULT
+      if (records.length >= maxRecords) {
+        const plan = compactRecords(records, Date.now())
+        if (plan !== null) {
+          const aggregate = archive === null ? plan.aggregate : mergeAggregates(archive.aggregate, plan.aggregate)
+          const nextArchive: ArchiveFile = { version: 1, cutoffTs: plan.cutoffTs, aggregate }
+          const retainedData = plan.retained.length === 0
+            ? ''
+            : `${plan.retained.map(record => JSON.stringify(record)).join('\n')}\n`
+          try {
+            writeFileAtomic(ARCHIVE_FILE, JSON.stringify(nextArchive))
+            // Once the archive is committed, it is the durable guard against
+            // replaying the old detail prefix. Reflect that guard in memory
+            // before attempting the second file write.
+            archive = nextArchive
+            records.length = 0
+            records.push(...plan.retained)
+            seen.clear()
+            for (const record of records) seen.add(`${record.sessionId}:${record.seq}`)
+            summaryCache.dirty = true
+            writeFileAtomic(RECORDS_FILE, retainedData)
+            persistBackfillState()
+          } catch {
+            // If the detail rewrite fails, the committed archive filters the
+            // old rows on next boot; the in-memory view already matches it.
+          }
         }
       }
     } catch {
@@ -679,20 +1775,29 @@ export function apply(ctx: Context): void {
     }
   })()
 
-  // The /api/stats-panel route family.
+  // The /api/stats-panel route family. LAN authorities are read once at load:
+  // the guard runs per request, but re-reading settings.yaml on every call would
+  // put disk IO on the hot path.
+  const lanHosts = readLanHosts()
+
   const route = {
     kind: 'exact' as const,
     path: '/api/stats-panel/summary',
     handler: async (req: IncomingMessage, res: ServerResponse) => {
-      if (!isLoopbackRequest(req)) {
-        writeJson(res, 403, { error: 'forbidden: loopback-only' })
+      if (!isStatsRequestAllowed(req, lanHosts)) {
+        writeJson(res, 403, { error: lanHosts.length === 0 ? 'forbidden: loopback-only' : 'forbidden: undeclared origin' })
         return
       }
       if (req.method !== 'GET' && req.method !== undefined) {
         writeJson(res, 405, { error: `method not allowed: ${req.method}` })
         return
       }
-      writeJson(res, 200, computeSummary(records))
+      // Re-fold only after new records landed; identical requests are free.
+      if (summaryCache.dirty || summaryCache.value === undefined) {
+        summaryCache.value = computeSummary(records, archive?.aggregate)
+        summaryCache.dirty = false
+      }
+      writeJson(res, 200, summaryCache.value)
     },
   }
   ctx.webServer.register(route)
@@ -705,8 +1810,8 @@ export function apply(ctx: Context): void {
     kind: 'exact' as const,
     path: '/api/stats-panel/balances',
     handler: async (req: IncomingMessage, res: ServerResponse) => {
-      if (!isLoopbackRequest(req)) {
-        writeJson(res, 403, { error: 'forbidden: loopback-only' })
+      if (!isStatsRequestAllowed(req, lanHosts)) {
+        writeJson(res, 403, { error: lanHosts.length === 0 ? 'forbidden: loopback-only' : 'forbidden: undeclared origin' })
         return
       }
       if (req.method !== 'GET' && req.method !== undefined) {
@@ -721,34 +1826,47 @@ export function apply(ctx: Context): void {
         writeJson(res, 200, { balances: cached.balances, cached: true })
         return
       }
-      const credentials = ctx.get('credentials')
-      const resolveKey = async (name: string): Promise<string | undefined> => {
-        if (credentials === undefined || name === '') return undefined
-        try {
-          const resolved = await credentials.resolve(name)
-          return resolved?.value
-        } catch {
-          return undefined
+      // One shared probe round per window: concurrent requests (several tabs,
+      // poll timers racing the TTL) await the same promise instead of
+      // double-hitting every provider API. Channels probe in parallel — a
+      // slow WAF challenge on one must not add its latency to the others.
+      if (balancesInFlight === undefined) {
+        const credentials = ctx.get('credentials')
+        const resolveKey = async (name: string): Promise<string | undefined> => {
+          if (credentials === undefined || name === '') return undefined
+          try {
+            const resolved = await credentials.resolve(name)
+            return resolved?.value
+          } catch {
+            return undefined
+          }
         }
-      }
-      const results: ChannelBalance[] = []
-      const seen = new Set<string>()
-      for (const config of readProviderConfigs()) {
-        if (seen.has(config.provider)) continue
-        seen.add(config.provider)
-        try {
-          results.push(await probeChannel(ctx, config, resolveKey))
-        } catch (e) {
-          results.push({
-            channel: config.provider,
-            kind: 'plan',
-            displayName: config.displayName,
-            error: `查询失败：${e instanceof Error ? e.message : String(e)}`,
-          })
+        const configs: ProviderConfig[] = []
+        const seen = new Set<string>()
+        for (const config of readProviderConfigs()) {
+          if (seen.has(config.provider)) continue
+          seen.add(config.provider)
+          configs.push(config)
         }
+        balancesInFlight = Promise.all(configs.map(async config => {
+          try {
+            return await probeChannel(ctx, config, resolveKey)
+          } catch (e) {
+            return {
+              channel: config.provider,
+              kind: 'plan' as const,
+              displayName: config.displayName,
+              error: `查询失败：${e instanceof Error ? e.message : String(e)}`,
+            }
+          }
+        })).then(results => {
+          balancesCache.set(results)
+          return results
+        }).finally(() => {
+          balancesInFlight = undefined
+        })
       }
-      balancesCache.set(results)
-      writeJson(res, 200, { balances: results })
+      writeJson(res, 200, { balances: await balancesInFlight })
     },
   }
   ctx.webServer.register(balancesRoute)

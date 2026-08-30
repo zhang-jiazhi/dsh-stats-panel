@@ -1,6 +1,6 @@
 # dsh-stats-panel: token usage statistics for the web GUI.
 # The host half collects usage and serves /api/stats-panel/summary; the
-# client half registers the settings-sidebar section and auto-composes from
+# client half registers the conversation-view stats tab and auto-composes from
 # dsh.client.platform (no patch row needed).
 - insert:
     - id: stats-panel-host

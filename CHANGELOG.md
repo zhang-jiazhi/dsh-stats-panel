@@ -2,7 +2,7 @@
 
 本插件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
-## [未发布]
+## [0.4.0] - 2026-08-31
 
 ### 修复
 

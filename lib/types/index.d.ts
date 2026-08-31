@@ -58,6 +58,12 @@ export interface StatsSummary {
     /** Calendar month buckets, keyed `YYYY-MM`, ascending. */
     monthlyStats: DailyStats[];
     recentRecords: UsageRecord[];
+    /** Bucket calendar offset used for day/week/month keys (minutes east of UTC). */
+    bucketOffsetMinutes: number;
+    /** Today's bucket key under that calendar — the browser reads「今日」from it. */
+    dayKeyNow: string;
+    /** Present only when the archive was folded under a different calendar. */
+    bucketNotice?: string;
 }
 export interface ModelStats {
     model: string;
@@ -178,7 +184,7 @@ export interface UsageAggregate {
     monthlyStats: DailyStats[];
 }
 /** Aggregates over a record range (the compaction payload). */
-export declare function aggregateOf(records: readonly UsageRecord[]): UsageAggregate;
+export declare function aggregateOf(records: readonly UsageRecord[], offsetMinutes?: number): UsageAggregate;
 /** Merge two aggregates (e.g. an existing archive with a newly archived range). */
 export declare function mergeAggregates(a: UsageAggregate, b: UsageAggregate): UsageAggregate;
 /**
@@ -187,7 +193,7 @@ export declare function mergeAggregates(a: UsageAggregate, b: UsageAggregate): U
  * and records arriving after the snapshot are not silently discarded.
  * @returns the archive payload and retained detail rows, or `null` when no row is eligible.
  */
-export declare function compactRecords(records: readonly UsageRecord[], now: number): {
+export declare function compactRecords(records: readonly UsageRecord[], now: number, offsetMinutes?: number): {
     cutoffTs: number;
     aggregate: UsageAggregate;
     retained: UsageRecord[];
@@ -195,8 +201,19 @@ export declare function compactRecords(records: readonly UsageRecord[], now: num
 /**
  * Compute the summary aggregates: fold the detail records, optionally on top
  * of the compacted archive aggregate, so totals stay exact across compaction.
+ *
+ * @param options.offsetMinutes - bucket calendar offset (minutes east of UTC).
+ *   Defaults to 0 (UTC) so the exported pure function keeps its original
+ *   behaviour for callers and tests; `apply()` passes the configured value.
+ * @param options.now - clock used for `dayKeyNow`; defaults to Date.now().
+ * @param options.archiveOffsetMinutes - the offset the archive was folded with,
+ *   surfaced as `bucketNotice` when it differs from the live one.
  */
-export declare function computeSummary(records: readonly UsageRecord[], archive?: UsageAggregate): StatsSummary;
+export declare function computeSummary(records: readonly UsageRecord[], archive?: UsageAggregate, options?: {
+    offsetMinutes?: number;
+    now?: number;
+    archiveOffsetMinutes?: number;
+}): StatsSummary;
 /**
  * Mount the collector and routes.
  * @param ctx - host plugin context carrying webServer.

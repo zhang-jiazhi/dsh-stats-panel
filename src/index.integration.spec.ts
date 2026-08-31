@@ -48,7 +48,7 @@ function usageEvent(seq: number, inputTokens: number, outputTokens: number, time
   }
 }
 
-function mount(query?: unknown, persistence?: unknown): {
+function mount(query?: unknown, persistence?: unknown, credentials?: unknown): {
   listeners: Map<string, Listener>
   routes: Map<string, RegisteredRoute>
 } {
@@ -61,6 +61,7 @@ function mount(query?: unknown, persistence?: unknown): {
     get(name: string): unknown {
       if (name === 'sessionQuery') return query
       if (name === 'sessionPersistence') return persistence
+      if (name === 'credentials') return credentials
       return undefined
     },
     webServer: {
@@ -112,6 +113,18 @@ async function readSummary(harness: ReturnType<typeof mount>): Promise<StatsSumm
   await route.handler(request(), response)
   expect(status).toBe(200)
   return JSON.parse(payload) as StatsSummary
+}
+
+async function readBalances(harness: ReturnType<typeof mount>): Promise<{ balances: Array<{ channel: string; error?: string }> }> {
+  const route = harness.routes.get('/api/stats-panel/balances')
+  if (route === undefined) throw new Error('balances route was not registered')
+  let payload = ''
+  const response = {
+    writeHead() {},
+    end(body?: string) { payload = body ?? '' },
+  } as unknown as ServerResponse
+  await route.handler(request(), response)
+  return JSON.parse(payload) as { balances: Array<{ channel: string; error?: string }> }
 }
 
 function detailRecord(
@@ -429,6 +442,47 @@ describe('host data integrity', () => {
     const retained = readFileSync(recordsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line) as UsageRecord)
     expect(retained.map(record => record.sessionId)).toEqual(['future-a', 'future-b'])
   })
+
+  it('compacts from the summary route so a long-lived host stays bounded', async () => {
+    process.env['DSH_STATS_COMPACT_MAX_RECORDS'] = '2'
+    try {
+      // 不注入 sessionQuery：启动期回填与压缩都不会跑，只剩路由这一条压缩路径。
+      const harness = mount()
+      const base = Date.now() - 60_000
+      emit(harness, 'live', sessionHeaderEvent('m', 'p', 0, base))
+      emit(harness, 'live', usageEvent(1, 10, 5, base + 1))
+      emit(harness, 'live', usageEvent(2, 20, 6, base + 2))
+      await settle()
+      expect(existsSync(archiveFile)).toBe(false)
+      const summary = await readSummary(harness)
+      expect(existsSync(archiveFile)).toBe(true)
+      // 压缩不得改变任何总量。
+      expect(summary.totalCalls).toBe(2)
+      expect(summary.totalTokens).toBe(41)
+      const retainedRows = readFileSync(recordsFile, 'utf8').split('\n').filter(line => line.trim() !== '')
+      expect(retainedRows.length).toBe(0)
+      expect((await readSummary(harness)).totalCalls).toBe(2)
+    } finally {
+      delete process.env['DSH_STATS_COMPACT_MAX_RECORDS']
+    }
+  })
+
+  it('bounds one balances round with the probe deadline', async () => {
+    const previousFetch = globalThis.fetch
+    process.env['DSH_STATS_BALANCE_DEADLINE_MS'] = '30'
+    globalThis.fetch = (() => new Promise(() => {})) as unknown as typeof fetch
+    try {
+      const harness = mount(undefined, undefined, { resolve: async () => ({ value: 'test-key' }) })
+      const started = Date.now()
+      const body = await readBalances(harness)
+      // 上游永不返回时，整轮仍必须在截止时间附近收口，而不是被单个渠道拖住。
+      expect(Date.now() - started).toBeLessThan(3_000)
+      expect(body.balances.filter(row => row.error?.includes('查询超时') === true).length).toBeGreaterThan(0)
+    } finally {
+      globalThis.fetch = previousFetch
+      delete process.env['DSH_STATS_BALANCE_DEADLINE_MS']
+    }
+  })
 })
 
 describe('pure aggregate invariants', () => {
@@ -467,5 +521,69 @@ describe('pure aggregate invariants', () => {
     expect(summary.channelStats.map(entry => entry.channel)).toEqual(expect.arrayContaining(['p1', 'p2']))
     expect(summary.dailyStats.map(entry => entry.date)).toEqual(expect.arrayContaining(['2026-01-01', '2026-02-01']))
     expect(summary.monthlyStats.map(entry => entry.period)).toEqual(expect.arrayContaining(['2026-01', '2026-02']))
+  })
+
+  it('reports the prompt-cache hit rate over the prompt-side buckets only', () => {
+    const summary = plugin.computeSummary([
+      {
+        ...detailRecord('s', 1, 'm', 'p', 30, 1000, Date.UTC(2026, 0, 1)),
+        cacheReadTokens: 60,
+        cacheWriteTokens: 10,
+      },
+    ])
+    // Prompt side = 30 uncached + 60 read + 10 write = 100; hits = 60 → 60%.
+    // The 1000 output tokens are not prompt tokens and must not dilute it, and
+    // a cache WRITE is a miss, so it never counts as a hit.
+    expect(summary.cacheHitRate).toBeCloseTo(60, 10)
+    expect(summary.totalTokens).toBe(1100)
+  })
+
+  it('reports a zero hit rate instead of NaN when nothing was sent as prompt', () => {
+    const summary = plugin.computeSummary([detailRecord('s', 1, 'm', 'p', 0, 42, Date.UTC(2026, 0, 1))])
+    expect(summary.cacheHitRate).toBe(0)
+  })
+
+  it('returns recent records newest-first regardless of collection order', () => {
+    // The boot backfill appends session by session, so collection order is not
+    // timestamp order: a plain tail slice would surface the wrong rows.
+    const summary = plugin.computeSummary([
+      detailRecord('backfilled', 1, 'm', 'p', 1, 1, Date.UTC(2026, 0, 3)),
+      detailRecord('backfilled', 2, 'm', 'p', 1, 1, Date.UTC(2026, 0, 1)),
+      detailRecord('live', 7, 'm', 'p', 1, 1, Date.UTC(2026, 0, 2)),
+    ])
+    expect(summary.recentRecords.map(record => record.ts)).toEqual([
+      Date.UTC(2026, 0, 3), Date.UTC(2026, 0, 2), Date.UTC(2026, 0, 1),
+    ])
+    expect(summary.recentRecords[0].sessionId).toBe('backfilled')
+  })
+  it('buckets day/week/month under the configured calendar and reports today under it', () => {
+    // 2026-01-01T20:30Z 在 UTC+8 已是 1 月 2 日 04:30。
+    const evening = Date.UTC(2026, 0, 1, 20, 30)
+    const local = plugin.computeSummary([detailRecord('s', 1, 'm', 'p', 1, 1, evening)], undefined, {
+      offsetMinutes: 480,
+      now: evening,
+    })
+    expect(local.dailyStats.map(bucket => bucket.date)).toEqual(['2026-01-02'])
+    expect(local.dayKeyNow).toBe('2026-01-02')
+    expect(local.bucketOffsetMinutes).toBe(480)
+    // 默认（不传偏移）仍是原来的 UTC 口径，纯函数向后兼容。
+    const utc = plugin.computeSummary([detailRecord('s', 1, 'm', 'p', 1, 1, evening)])
+    expect(utc.dailyStats.map(bucket => bucket.date)).toEqual(['2026-01-01'])
+    expect(utc.bucketOffsetMinutes).toBe(0)
+  })
+
+  it('flags an archive folded under a different calendar without changing totals', () => {
+    const archived = plugin.aggregateOf([detailRecord('a', 1, 'm', 'p', 3, 2, Date.UTC(2026, 0, 1))], 0)
+    const shifted = plugin.computeSummary([], archived, {
+      offsetMinutes: 480,
+      archiveOffsetMinutes: 0,
+      now: Date.UTC(2026, 0, 2),
+    })
+    expect(shifted.bucketNotice).toContain('+00:00')
+    expect(shifted.bucketNotice).toContain('+08:00')
+    expect(shifted.totalCalls).toBe(1)
+    expect(shifted.totalTokens).toBe(5)
+    const aligned = plugin.computeSummary([], archived, { offsetMinutes: 0, archiveOffsetMinutes: 0 })
+    expect(aligned.bucketNotice).toBeUndefined()
   })
 })

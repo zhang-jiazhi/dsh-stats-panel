@@ -57,6 +57,7 @@
     "typecheck": "tsc --noEmit",
     "build:types": "tsc -p tsconfig.build.json",
     "build": "tsc -p tsconfig.build.json && tsdown --env.DSH_BUILD_FACE=client",
+    "build:host": "tsdown --config tsdown.host.config.ts",
     "verify:balances": "node scripts/verify-balances.mjs"
   },
   "devDependencies": {

@@ -22,6 +22,8 @@ import React, { useState, useEffect, useCallback, useRef, Component, type ReactN
 
 interface UsageRecord {
   ts: number
+  /** Durable session event seq — with sessionId it is the row's stable identity. */
+  seq: number
   sessionId: string
   model: string
   provider: string
@@ -102,6 +104,12 @@ interface StatsSummary {
   /** Calendar month buckets, keyed `YYYY-MM`, ascending. */
   monthlyStats: DailyStats[]
   recentRecords: UsageRecord[]
+  /** Bucket calendar offset the host used (minutes east of UTC). */
+  bucketOffsetMinutes?: number
+  /** Today's bucket key under that calendar — authoritative over the browser's own clock. */
+  dayKeyNow?: string
+  /** Present when the archived段 was folded under a different calendar. */
+  bucketNotice?: string
 }
 
 /** Per-model price, CNY per 1M tokens. */
@@ -560,8 +568,11 @@ function KpiRow({ stats, prices, dayKey }: { stats: StatsSummary; prices: PriceT
   // The host buckets days by UTC date (toISOString), so match that key here.
   // `dayKey` comes from the view so a dashboard left open re-buckets at midnight
   // even when the payload compare keeps the old object.
-  const todayKey = dayKey
-  const yesterdayKey = new Date(new Date(`${dayKey}T00:00:00Z`).getTime() - 86_400_000).toISOString().slice(0, 10)
+  // The host owns the bucket calendar (local by default, configurable), so its
+  // key wins over anything the browser could derive on its own; `dayKey` stays
+  // as the fallback for a payload from a host that predates the field.
+  const todayKey = stats.dayKeyNow ?? dayKey
+  const yesterdayKey = new Date(new Date(`${todayKey}T00:00:00Z`).getTime() - 86_400_000).toISOString().slice(0, 10)
   const today = stats.dailyStats.find(d => d.date === todayKey)
   const yesterday = stats.dailyStats.find(d => d.date === yesterdayKey)
   const unconfigured = stats.modelStats.filter(m => prices[m.model] === undefined).length
@@ -588,11 +599,12 @@ function KpiRow({ stats, prices, dayKey }: { stats: StatsSummary; prices: PriceT
         sub={today !== undefined
           ? `输入 ${formatTokens(today.inputTokens)} · 输出 ${formatTokens(today.outputTokens)}`
           : '今天还没有调用'}
-        title="按 UTC 日聚合（与服务端每日统计口径一致）"
+        title="按服务端配置的日历分桶（默认主机本地时区，可用 settings.yaml 的 stats-panel.dayBoundary 改为 utc）"
         chip={dayChip} />
       <KpiCard accent="#20c997" icon={<IconTarget color="#20c997" />} label="缓存命中率"
         value={`${stats.cacheHitRate.toFixed(1)}%`}
-        sub={`读 ${formatTokens(stats.totalCacheReadTokens)} / 写 ${formatTokens(stats.totalCacheWriteTokens)}`} />
+        sub={`读 ${formatTokens(stats.totalCacheReadTokens)} / 写 ${formatTokens(stats.totalCacheWriteTokens)}`}
+        title="缓存读 ÷ 提示侧总量（未命中输入 + 缓存读 + 缓存写），与 DSH 会话内命中率口径一致；输出 token 不计入" />
       <KpiCard accent="#ff922b" icon={<IconCoin color="#ff922b" />} label="估算费用"
         value={formatCny(totalCost)}
         sub={unconfigured > 0 ? `${unconfigured} 个模型价格待配置` : '按价格表计算'} />
@@ -732,8 +744,10 @@ function TrendCard({ stats }: { stats: StatsSummary }): React.ReactElement {
             <span style={styles.trendFooterSep}>·</span>
             {days.reduce((s, d) => s + d.calls, 0).toLocaleString()} 次调用
             <span style={styles.trendFooterSep}>·</span>
-            日均 {formatTokens(days.reduce((s, d) => s + d.totalTokens, 0) / days.length)}
+            {active === 'day' ? '日均 ' : active === 'week' ? '周均 ' : '月均 '}
+            {formatTokens(days.reduce((s, d) => s + d.totalTokens, 0) / days.length)}
           </div>
+          {stats.bucketNotice !== undefined ? <div style={styles.bucketNotice}>{stats.bucketNotice}</div> : null}
         </>
       )}
     </div>
@@ -1291,8 +1305,8 @@ function RecordsTable({ data, prices }: { data: UsageRecord[]; prices: PriceTabl
             </tr>
           </thead>
           <tbody>
-            {data.slice(0, 100).map((r, i) => (
-              <tr key={`${r.sessionId}-${i}`}>
+            {data.slice(0, 100).map(r => (
+              <tr key={`${r.sessionId}-${r.seq}`}>
                 <td style={styles.td}>{new Date(r.ts).toLocaleString()}</td>
                 <td style={styles.td}>{channelName(r.provider)}</td>
                 <td style={styles.td} title={r.model}>{r.model}</td>
@@ -1822,6 +1836,14 @@ const styles: Record<string, React.CSSProperties> = {
   hint: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #999)', margin: '4px 0 10px', lineHeight: 1.6 },
   link: { color: 'var(--dsw-alias-state-business-primary, #4a9eff)' },
   muted: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #999)', margin: '10px 0' },
+  bucketNotice: {
+    fontSize: 11,
+    lineHeight: 1.5,
+    color: 'var(--dsw-alias-label-secondary, #999)',
+    marginTop: 6,
+    paddingTop: 6,
+    borderTop: '1px dashed var(--dsw-alias-separator, rgba(128,128,128,.25))',
+  },
   mutedInline: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #888)' },
   error: { fontSize: 12, color: '#ff6b6b', margin: '10px 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
   pending: { color: '#ffd43b', fontSize: 11 },

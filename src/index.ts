@@ -53,6 +53,14 @@ const BACKFILL_STATE_FILE = join(DATA_DIR, 'backfill-state.json')
 /** Default compaction trigger (records in memory). */
 const COMPACT_MAX_RECORDS_DEFAULT = 10_000
 
+/**
+ * Ceiling for one channel probe inside a balances round (ms). Individual
+ * adapters allow up to 20s + one retry, so without this ceiling a single slow
+ * upstream could hold the whole round — and the browser's spinner — for ~40s.
+ * Override with DSH_STATS_BALANCE_DEADLINE_MS.
+ */
+const BALANCE_PROBE_DEADLINE_MS_DEFAULT = 12_000
+
 /** MiMo 平台控制台登录 Cookie 文件（用于自动查询 Token Plan 套餐用量）。 */
 const MIMO_COOKIE_FILE = join(DATA_DIR, 'mimo-cookie.txt')
 
@@ -90,6 +98,12 @@ export interface StatsSummary {
   /** Calendar month buckets, keyed `YYYY-MM`, ascending. */
   monthlyStats: DailyStats[]
   recentRecords: UsageRecord[]
+  /** Bucket calendar offset used for day/week/month keys (minutes east of UTC). */
+  bucketOffsetMinutes: number
+  /** Today's bucket key under that calendar — the browser reads「今日」from it. */
+  dayKeyNow: string
+  /** Present only when the archive was folded under a different calendar. */
+  bucketNotice?: string
 }
 
 export interface ModelStats {
@@ -340,6 +354,42 @@ function readLanHosts(): string[] {
     // Unreadable settings: stay loopback-only.
   }
   return []
+}
+
+/**
+ * The calendar used for day / week / month buckets, as minutes east of UTC.
+ *
+ * ```yaml
+ * stats-panel:
+ *   dayBoundary: local   # local (default) | utc | +08:00 | 480
+ * ```
+ *
+ * Default is the host's own timezone, so「今日消耗」rolls over at local
+ * midnight instead of 08:00 for a UTC+8 operator. Detail rows keep raw
+ * timestamps, so switching this back to `utc` re-buckets everything that is
+ * still in records.jsonl — nothing is rewritten or lost either way.
+ * @returns minutes east of UTC (UTC+8 → 480).
+ */
+function readBucketOffsetMinutes(): number {
+  const local = -new Date().getTimezoneOffset()
+  let declared: unknown
+  try {
+    const root = parseSimpleYaml(readFileSync(SETTINGS_PATH, 'utf8')) as Record<string, unknown>
+    declared = (root['stats-panel'] as Record<string, unknown> | undefined)?.['dayBoundary']
+  } catch {
+    return local
+  }
+  if (typeof declared !== 'string') return local
+  const value = declared.trim().replace(/^['"]|['"]$/g, '').toLowerCase()
+  if (value === '' || value === 'local') return local
+  if (value === 'utc') return 0
+  const hhmm = /^([+-])(\d{1,2}):?(\d{2})$/.exec(value)
+  if (hhmm !== null) {
+    const minutes = Number(hhmm[2]) * 60 + Number(hhmm[3])
+    return hhmm[1] === '-' ? -minutes : minutes
+  }
+  const numeric = Number(value)
+  return Number.isFinite(numeric) && Math.abs(numeric) <= 900 ? numeric : local
 }
 
 /** Minimal YAML subset parser for settings.yaml provider maps (indent-aware, nested). */
@@ -1220,6 +1270,12 @@ interface ArchiveFile {
   /** Detail records with `ts < cutoffTs` are folded into `aggregate`. */
   cutoffTs: number
   aggregate: UsageAggregate
+  /**
+   * Bucket calendar the aggregate's day/week/month keys were folded under
+   * (minutes east of UTC). Absent in archives written before this field
+   * existed — those were folded under UTC, hence the 0 default on load.
+   */
+  bucketOffsetMinutes?: number
 }
 
 function loadArchive(): ArchiveFile | null {
@@ -1229,7 +1285,14 @@ function loadArchive(): ArchiveFile | null {
     if (parsed?.['version'] !== 1 || !isValidTimestamp(parsed['cutoffTs'])) return null
     const aggregate = normalizeAggregate(parsed['aggregate'])
     if (aggregate === null) return null
-    return { version: 1, cutoffTs: parsed['cutoffTs'], aggregate }
+    const offset = parsed['bucketOffsetMinutes']
+    return {
+      version: 1,
+      cutoffTs: parsed['cutoffTs'],
+      aggregate,
+      // Legacy archives predate the field and were folded under UTC.
+      bucketOffsetMinutes: typeof offset === 'number' && Number.isFinite(offset) ? offset : 0,
+    }
   } catch {
     return null
   }
@@ -1264,14 +1327,25 @@ function loadBackfillState(): BackfillState | null {
   return null
 }
 
-/** `YYYY-MM-DD` — the original daily key. */
-function dayKey(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10)
+/**
+ * Shift an instant into the bucket calendar so the UTC-based key helpers below
+ * read out local calendar fields. Detail rows keep their raw `ts`, so the
+ * bucket calendar is a pure presentation choice and stays reversible.
+ * @param ts - epoch milliseconds.
+ * @param offsetMinutes - minutes east of UTC (UTC+8 → 480).
+ */
+function shiftToBucketCalendar(ts: number, offsetMinutes: number): Date {
+  return new Date(ts + offsetMinutes * 60_000)
 }
 
-/** `YYYY-MM` — calendar month. */
-function monthKey(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 7)
+/** `YYYY-MM-DD` — the daily key in the bucket calendar. */
+function dayKey(ts: number, offsetMinutes: number): string {
+  return shiftToBucketCalendar(ts, offsetMinutes).toISOString().slice(0, 10)
+}
+
+/** `YYYY-MM` — calendar month in the bucket calendar. */
+function monthKey(ts: number, offsetMinutes: number): string {
+  return shiftToBucketCalendar(ts, offsetMinutes).toISOString().slice(0, 7)
 }
 
 /**
@@ -1280,8 +1354,8 @@ function monthKey(ts: number): string {
  * DST boundary, and keyed by the ISO week-numbering year, which is why a date
  * like 2027-01-01 correctly reports `2026-W53`.
  */
-function isoWeekKey(ts: number): string {
-  const date = new Date(ts)
+function isoWeekKey(ts: number, offsetMinutes: number): string {
+  const date = shiftToBucketCalendar(ts, offsetMinutes)
   const shifted = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
   // Monday = 0 … Sunday = 6, then jump to that week's Thursday.
   shifted.setUTCDate(shifted.getUTCDate() - ((shifted.getUTCDay() + 6) % 7) + 3)
@@ -1368,8 +1442,11 @@ function newFold(): FoldState {
   }
 }
 
-/** Fold one record into the accumulators. */
-function foldRecord(fold: FoldState, record: UsageRecord): void {
+/**
+ * Fold one record into the accumulators.
+ * @param offsetMinutes - bucket calendar offset, minutes east of UTC.
+ */
+function foldRecord(fold: FoldState, record: UsageRecord, offsetMinutes: number): void {
   const totals = fold.totals
   totals.calls++
   totals.inputTokens += record.inputTokens
@@ -1426,9 +1503,9 @@ function foldRecord(fold: FoldState, record: UsageRecord): void {
     })
   }
 
-  accumulateBucket(fold.dailyMap, dayKey(record.ts), record, recordTotal)
-  accumulateBucket(fold.weeklyMap, isoWeekKey(record.ts), record, recordTotal)
-  accumulateBucket(fold.monthlyMap, monthKey(record.ts), record, recordTotal)
+  accumulateBucket(fold.dailyMap, dayKey(record.ts, offsetMinutes), record, recordTotal)
+  accumulateBucket(fold.weeklyMap, isoWeekKey(record.ts, offsetMinutes), record, recordTotal)
+  accumulateBucket(fold.monthlyMap, monthKey(record.ts, offsetMinutes), record, recordTotal)
 }
 
 /** Fold an already-aggregated range (archive) into the accumulators. */
@@ -1495,9 +1572,9 @@ function foldAggregate(fold: FoldState, aggregate: UsageAggregate): void {
 }
 
 /** Aggregates over a record range (the compaction payload). */
-export function aggregateOf(records: readonly UsageRecord[]): UsageAggregate {
+export function aggregateOf(records: readonly UsageRecord[], offsetMinutes = 0): UsageAggregate {
   const fold = newFold()
-  for (const record of records) foldRecord(fold, record)
+  for (const record of records) foldRecord(fold, record, offsetMinutes)
   return foldToAggregate(fold)
 }
 
@@ -1529,13 +1606,14 @@ export function mergeAggregates(a: UsageAggregate, b: UsageAggregate): UsageAggr
 export function compactRecords(
   records: readonly UsageRecord[],
   now: number,
+  offsetMinutes = 0,
 ): { cutoffTs: number; aggregate: UsageAggregate; retained: UsageRecord[] } | null {
   if (records.length === 0 || !isValidTimestamp(now)) return null
   const compactable = records.filter(record => record.ts < now)
   if (compactable.length === 0) return null
   return {
     cutoffTs: now,
-    aggregate: aggregateOf(compactable),
+    aggregate: aggregateOf(compactable, offsetMinutes),
     retained: records.filter(record => record.ts >= now),
   }
 }
@@ -1543,15 +1621,34 @@ export function compactRecords(
 /**
  * Compute the summary aggregates: fold the detail records, optionally on top
  * of the compacted archive aggregate, so totals stay exact across compaction.
+ *
+ * @param options.offsetMinutes - bucket calendar offset (minutes east of UTC).
+ *   Defaults to 0 (UTC) so the exported pure function keeps its original
+ *   behaviour for callers and tests; `apply()` passes the configured value.
+ * @param options.now - clock used for `dayKeyNow`; defaults to Date.now().
+ * @param options.archiveOffsetMinutes - the offset the archive was folded with,
+ *   surfaced as `bucketNotice` when it differs from the live one.
  */
-export function computeSummary(records: readonly UsageRecord[], archive?: UsageAggregate): StatsSummary {
+export function computeSummary(
+  records: readonly UsageRecord[],
+  archive?: UsageAggregate,
+  options: { offsetMinutes?: number; now?: number; archiveOffsetMinutes?: number } = {},
+): StatsSummary {
+  const offsetMinutes = options.offsetMinutes ?? 0
   const fold = newFold()
-  for (const record of records) foldRecord(fold, record)
+  for (const record of records) foldRecord(fold, record, offsetMinutes)
   if (archive !== undefined) foldAggregate(fold, archive)
 
   const totalTokens = fold.totals.inputTokens + fold.totals.outputTokens + fold.totals.cacheReadTokens + fold.totals.cacheWriteTokens
-  const cacheHitRate = totalTokens > 0
-    ? ((fold.totals.cacheReadTokens + fold.totals.cacheWriteTokens) / totalTokens) * 100
+  // Prompt-cache hit rate over the three DISJOINT prompt-side buckets
+  // (uncached input + cache read + cache write), matching the harness's own
+  // definition in dsh-client-ui-chat (`formatCacheHitPercent(cacheReadTokens,
+  // totalTokens - outputTokens)`). Output tokens are never prompt tokens, and a
+  // cache WRITE is a miss that populates the cache — neither belongs in the
+  // numerator or the denominator of a hit rate.
+  const promptTokens = fold.totals.inputTokens + fold.totals.cacheReadTokens + fold.totals.cacheWriteTokens
+  const cacheHitRate = promptTokens > 0
+    ? (fold.totals.cacheReadTokens / promptTokens) * 100
     : 0
 
   return {
@@ -1568,8 +1665,27 @@ export function computeSummary(records: readonly UsageRecord[], archive?: UsageA
     dailyStats: Array.from(fold.dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
     weeklyStats: Array.from(fold.weeklyMap.values()).sort((a, b) => a.period.localeCompare(b.period)),
     monthlyStats: Array.from(fold.monthlyMap.values()).sort((a, b) => a.period.localeCompare(b.period)),
-    recentRecords: records.slice(-100).reverse(),
+    // Newest-first by timestamp. The detail array is in COLLECTION order, which
+    // is not timestamp order: the boot backfill appends session by session, so a
+    // plain tail slice can surface an arbitrary session's rows as "recent".
+    recentRecords: [...records].sort((a, b) => b.ts - a.ts || b.seq - a.seq).slice(0, 100),
+    bucketOffsetMinutes: offsetMinutes,
+    dayKeyNow: dayKey(options.now ?? Date.now(), offsetMinutes),
+    // Archived rows were folded under the offset in force at compaction time and
+    // cannot be re-split (their detail is gone). Totals stay exact either way;
+    // only the calendar boundary of already-archived days is approximate.
+    ...(archive !== undefined && options.archiveOffsetMinutes !== undefined
+      && options.archiveOffsetMinutes !== offsetMinutes
+      ? { bucketNotice: `历史归档按 UTC${formatOffset(options.archiveOffsetMinutes)} 分桶，当前按 UTC${formatOffset(offsetMinutes)}；总量不受影响，仅归档段的日期边界为近似值` }
+      : {}),
   }
+}
+
+/** `+08:00` / `-05:30` / `+00:00` — offset text for operator-facing notices. */
+function formatOffset(offsetMinutes: number): string {
+  const sign = offsetMinutes < 0 ? '-' : '+'
+  const abs = Math.abs(offsetMinutes)
+  return `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`
 }
 
 /**
@@ -1593,6 +1709,11 @@ export function apply(ctx: Context): void {
   const bootArchive = loadArchive()
   let archive: ArchiveFile | null = bootArchive
   let records = loadRecords(bootArchive?.cutoffTs)
+  /** Calendar for day/week/month buckets; read once, like lanHosts. */
+  const bucketOffsetMinutes = readBucketOffsetMinutes()
+  /** Compaction trigger, overridable for tests and constrained hosts. */
+  const configuredMax = Number(process.env['DSH_STATS_COMPACT_MAX_RECORDS'])
+  const maxRecords = Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : COMPACT_MAX_RECORDS_DEFAULT
   // (sessionId, seq) of every event already collected — dedupes the
   // asynchronous backfill against live listeners AND against previous
   // process runs (records persisted in earlier boots carry their seq).
@@ -1653,6 +1774,69 @@ export function apply(ctx: Context): void {
   ctx.on('session/disposed', (session) => {
     liveRoutes.delete(session.id)
   })
+
+  /**
+   * After a runtime compaction the detail log is shorter than the count the
+   * backfill skip-cache was written with, which would force a full resweep at
+   * the next boot. Rewrite just that counter and keep the revisions.
+   */
+  const refreshBackfillRecordCount = (): void => {
+    const state = loadBackfillState()
+    if (state === null) return
+    try {
+      writeFileAtomic(BACKFILL_STATE_FILE, JSON.stringify({
+        version: 2, revisions: state.revisions, recordsAtWrite: records.length,
+      } satisfies BackfillState))
+    } catch {
+      // Next boot rechecks revisions — safe, just slower.
+    }
+  }
+
+  /**
+   * Fold the eligible detail prefix into the archive once the detail log grows
+   * past the retention ceiling. Called at boot AND opportunistically from the
+   * summary route, so a host that stays up for weeks still compacts instead of
+   * growing the detail log without bound.
+   *
+   * Order is crash-safe — loadRecords and collect() both ignore detail below
+   * `cutoffTs`, so a records rewrite that never lands cannot double-count.
+   * @param persistState - boot-path hook that rewrites the full skip-cache.
+   */
+  const maybeCompact = (persistState?: () => void): void => {
+    if (records.length < maxRecords) return
+    const plan = compactRecords(records, Date.now(), bucketOffsetMinutes)
+    if (plan === null) return
+    const aggregate = archive === null ? plan.aggregate : mergeAggregates(archive.aggregate, plan.aggregate)
+    const nextArchive: ArchiveFile = {
+      version: 1,
+      cutoffTs: plan.cutoffTs,
+      aggregate,
+      // A merge inherits the OLDER calendar: rows already folded under it cannot
+      // be re-split, so the archive keeps advertising that boundary and the
+      // summary keeps telling the operator about it.
+      bucketOffsetMinutes: archive === null ? bucketOffsetMinutes : (archive.bucketOffsetMinutes ?? 0),
+    }
+    const retainedData = plan.retained.length === 0
+      ? ''
+      : `${plan.retained.map(record => JSON.stringify(record)).join('\n')}\n`
+    try {
+      writeFileAtomic(ARCHIVE_FILE, JSON.stringify(nextArchive))
+      // Once the archive is committed, it is the durable guard against replaying
+      // the old detail prefix. Reflect that guard in memory before the second write.
+      archive = nextArchive
+      records.length = 0
+      records.push(...plan.retained)
+      seen.clear()
+      for (const record of records) seen.add(`${record.sessionId}:${record.seq}`)
+      summaryCache.dirty = true
+      writeFileAtomic(RECORDS_FILE, retainedData)
+      if (persistState !== undefined) persistState()
+      else refreshBackfillRecordCount()
+    } catch {
+      // If the detail rewrite fails, the committed archive filters the old rows
+      // on next boot; the in-memory view already matches it.
+    }
+  }
 
   // Historical backfill over persisted sessions (async, best effort, never
   // blocks or fails the plugin), followed by the retention compaction. A
@@ -1738,38 +1922,8 @@ export function apply(ctx: Context): void {
       }
       if (stateDirty) persistBackfillState()
       // Retention compaction folds the eligible detail prefix into the archive
-      // and retains future/boundary rows. Order is crash-safe —
-      // loadRecords and collect() both ignore detail below `cutoffTs`, so a
-      // records rewrite that never lands cannot double-count.
-      const configuredMax = Number(process.env['DSH_STATS_COMPACT_MAX_RECORDS'])
-      const maxRecords = Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : COMPACT_MAX_RECORDS_DEFAULT
-      if (records.length >= maxRecords) {
-        const plan = compactRecords(records, Date.now())
-        if (plan !== null) {
-          const aggregate = archive === null ? plan.aggregate : mergeAggregates(archive.aggregate, plan.aggregate)
-          const nextArchive: ArchiveFile = { version: 1, cutoffTs: plan.cutoffTs, aggregate }
-          const retainedData = plan.retained.length === 0
-            ? ''
-            : `${plan.retained.map(record => JSON.stringify(record)).join('\n')}\n`
-          try {
-            writeFileAtomic(ARCHIVE_FILE, JSON.stringify(nextArchive))
-            // Once the archive is committed, it is the durable guard against
-            // replaying the old detail prefix. Reflect that guard in memory
-            // before attempting the second file write.
-            archive = nextArchive
-            records.length = 0
-            records.push(...plan.retained)
-            seen.clear()
-            for (const record of records) seen.add(`${record.sessionId}:${record.seq}`)
-            summaryCache.dirty = true
-            writeFileAtomic(RECORDS_FILE, retainedData)
-            persistBackfillState()
-          } catch {
-            // If the detail rewrite fails, the committed archive filters the
-            // old rows on next boot; the in-memory view already matches it.
-          }
-        }
-      }
+      // and retains future/boundary rows.
+      maybeCompact(persistBackfillState)
     } catch {
       // No sessionQuery service (or a query failure): live-only collection.
     }
@@ -1792,9 +1946,17 @@ export function apply(ctx: Context): void {
         writeJson(res, 405, { error: `method not allowed: ${req.method}` })
         return
       }
-      // Re-fold only after new records landed; identical requests are free.
-      if (summaryCache.dirty || summaryCache.value === undefined) {
-        summaryCache.value = computeSummary(records, archive?.aggregate)
+      // Keep the detail log bounded on hosts that never restart. Compaction only
+      // does work past the ceiling, so this stays a length check on the hot path.
+      maybeCompact()
+      // Re-fold after new records landed, or when the bucket day rolled over so a
+      // dashboard left open across midnight stops reporting yesterday as today.
+      if (summaryCache.dirty || summaryCache.value === undefined
+        || summaryCache.value.dayKeyNow !== dayKey(Date.now(), bucketOffsetMinutes)) {
+        summaryCache.value = computeSummary(records, archive?.aggregate, {
+          offsetMinutes: bucketOffsetMinutes,
+          archiveOffsetMinutes: archive?.bucketOffsetMinutes,
+        })
         summaryCache.dirty = false
       }
       writeJson(res, 200, summaryCache.value)
@@ -1848,9 +2010,28 @@ export function apply(ctx: Context): void {
           seen.add(config.provider)
           configs.push(config)
         }
+        // Every probe races a deadline: a single stalled upstream must not hold
+        // the whole round. The loser keeps running with its own fetch timeout and
+        // its result is discarded; the row comes back as an explicit timeout so
+        // the panel never presents a missing channel as zero usage.
+        const configuredDeadline = Number(process.env['DSH_STATS_BALANCE_DEADLINE_MS'])
+        const deadlineMs = Number.isFinite(configuredDeadline) && configuredDeadline > 0
+          ? configuredDeadline
+          : BALANCE_PROBE_DEADLINE_MS_DEFAULT
         balancesInFlight = Promise.all(configs.map(async config => {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const deadline = new Promise<ChannelBalance>(resolve => {
+            timer = setTimeout(() => {
+              resolve({
+                channel: config.provider,
+                kind: 'plan' as const,
+                displayName: config.displayName,
+                error: `查询超时（超过 ${Math.round(deadlineMs / 1000)} 秒）`,
+              })
+            }, deadlineMs)
+          })
           try {
-            return await probeChannel(ctx, config, resolveKey)
+            return await Promise.race([probeChannel(ctx, config, resolveKey), deadline])
           } catch (e) {
             return {
               channel: config.provider,
@@ -1858,6 +2039,8 @@ export function apply(ctx: Context): void {
               displayName: config.displayName,
               error: `查询失败：${e instanceof Error ? e.message : String(e)}`,
             }
+          } finally {
+            if (timer !== undefined) clearTimeout(timer)
           }
         })).then(results => {
           balancesCache.set(results)

@@ -25,6 +25,13 @@ llm-pi-ai:
           name: Kimi K2.5
 ```
 
+分桶日历（可选，默认跟随主机本地时区）：
+
+```yaml
+stats-panel:
+  dayBoundary: local   # local(默认) | utc | +08:00 | 480（分钟）
+```
+
 凭据放入 `~/.dsh/.credentials.yaml`（或环境变量）：
 
 ```yaml

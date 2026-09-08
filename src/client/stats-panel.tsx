@@ -12,11 +12,17 @@
  * DeepSeek's official CNY peak-hour prices effective 2026-08-29 (source:
  * https://api-docs.deepseek.com/zh-cn/quick_start/pricing).
  *
+ * Scroll ownership: the shell renders every view tab inside one shared
+ * conversation scrollport whose chat half is pinned to the bottom. This view
+ * resets that scrollport to the top on mount and — via the `:has()` rules in
+ * {@link dashboardCss} — becomes its own scrollport, so the shared one never
+ * scrolls while the dashboard is active.
+ *
  * All rendering is contained: any fetch/render failure renders an inline
  * error card instead of throwing out of the view.
  */
 
-import React, { useState, useEffect, useCallback, useRef, Component, type ReactNode } from 'react'
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, Component, type ReactNode } from 'react'
 
 /* ------------------------------------------------------------------ types */
 
@@ -204,11 +210,19 @@ const DEFAULT_PRICES: PriceTable = {
   'unknown': { inputPerM: 0, outputPerM: 0, cacheReadPerM: 0, cacheWritePerM: 0 },
 }
 
-/** Chart palette — input / output / cache series and categorical fills. */
-const COLOR_INPUT = '#4a9eff'
-const COLOR_OUTPUT = '#51cf66'
-const COLOR_CACHE = '#cc5de8'
-const CHART_COLORS = ['#4a9eff', '#51cf66', '#cc5de8', '#ffd43b', '#ff922b', '#20c997', '#ff6b6b', '#868e96']
+/**
+ * Chart palette — deliberately desaturated so it sits calmly on both the warm
+ * dark skin and the default themes; the UI accent (theme business primary) is
+ * reserved for interactive chrome, never for data series.
+ */
+const COLOR_INPUT = '#7ea6d8'
+const COLOR_OUTPUT = '#6fbf8f'
+const COLOR_CACHE = '#b58cc9'
+const COLOR_REST = '#8a93a3'
+const CHART_COLORS = ['#7ea6d8', '#6fbf8f', '#b58cc9', '#d8a657', '#d98b8b', '#5fb3b3', '#c98fc0']
+
+/** Chart series colours exposed to the stylesheet as custom properties. */
+const SERIES_VARS = `--dsp-c-input: ${COLOR_INPUT}; --dsp-c-output: ${COLOR_OUTPUT}; --dsp-c-cache: ${COLOR_CACHE};`
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -253,6 +267,13 @@ function formatCny(cny: number): string {
   return `¥${cny.toFixed(2)}`
 }
 
+/** Compact `MM-DD HH:mm:ss` for the records list (stable across locales). */
+function formatRecordTime(ts: number): string {
+  const d = new Date(ts)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
 /** Cost of one model's usage under a price entry, CNY. */
 function modelCost(stat: ModelStats, price: ModelPrice | undefined): number {
   if (price === undefined) return 0
@@ -265,41 +286,48 @@ function modelCost(stat: ModelStats, price: ModelPrice | undefined): number {
 }
 
 function loadPrices(): PriceTable {
+  const stored: PriceTable = {}
   try {
     const raw = window.localStorage.getItem(PRICES_KEY)
     if (raw !== null) {
-      const parsed = JSON.parse(raw) as PriceTable
-      if (typeof parsed === 'object' && parsed !== null) {
-        // 与内置默认价按模型合并：用户编辑过的条目（含手动设 0）优先，
-        // 存量表里缺失的模型用默认价补齐——升级内置价格表不影响已有配置。
-        return { ...DEFAULT_PRICES, ...parsed }
+      const parsed = JSON.parse(raw) as Record<string, Partial<ModelPrice>>
+      for (const [model, price] of Object.entries(parsed)) {
+        if (price === null || typeof price !== 'object') continue
+        stored[model] = {
+          inputPerM: Number(price.inputPerM) || 0,
+          outputPerM: Number(price.outputPerM) || 0,
+          cacheReadPerM: Number(price.cacheReadPerM) || 0,
+          cacheWritePerM: Number(price.cacheWritePerM) || 0,
+        }
       }
     }
   } catch {
-    // Fall through to defaults.
+    // Ignore malformed storage and fall back to the defaults.
   }
-  return { ...DEFAULT_PRICES }
+  return { ...DEFAULT_PRICES, ...stored }
 }
 
 function savePrices(prices: PriceTable): void {
   try {
     window.localStorage.setItem(PRICES_KEY, JSON.stringify(prices))
   } catch {
-    // Ignore persistence failures.
+    // Ignore quota/serialization failures — the session keeps the edited table.
   }
 }
 
 function loadManualQuota(): Record<string, string> {
   try {
     const raw = window.localStorage.getItem(MANUAL_QUOTA_KEY)
-    if (raw !== null) {
-      const parsed = JSON.parse(raw) as Record<string, string>
-      if (typeof parsed === 'object' && parsed !== null) return parsed
+    if (raw === null) return {}
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const out: Record<string, string> = {}
+    for (const [channel, note] of Object.entries(parsed)) {
+      if (typeof note === 'string') out[channel] = note
     }
+    return out
   } catch {
-    // Fall through.
+    return {}
   }
-  return {}
 }
 
 /* ------------------------------------------------- session-scope payloads */
@@ -331,7 +359,7 @@ function utcDayKey(): string {
 
 function IconPulse({ color }: { color: string }): React.ReactElement {
   return (
-    <svg width={14} height={14} viewBox="0 0 16 16" fill="none" aria-hidden>
+    <svg width={15} height={15} viewBox="0 0 16 16" fill="none" aria-hidden>
       <path d="M1.5 8h2.6l2-4.6 3 9.2 2-4.6h3.4" stroke={color} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
@@ -339,7 +367,7 @@ function IconPulse({ color }: { color: string }): React.ReactElement {
 
 function IconLayers({ color }: { color: string }): React.ReactElement {
   return (
-    <svg width={14} height={14} viewBox="0 0 16 16" fill="none" aria-hidden>
+    <svg width={15} height={15} viewBox="0 0 16 16" fill="none" aria-hidden>
       <path d="M8 1.8 14.2 5 8 8.2 1.8 5 8 1.8Z" stroke={color} strokeWidth={1.4} strokeLinejoin="round" />
       <path d="M2.5 8.4 8 11.2l5.5-2.8M2.5 11.4 8 14.2l5.5-2.8" stroke={color} strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
@@ -348,7 +376,7 @@ function IconLayers({ color }: { color: string }): React.ReactElement {
 
 function IconClock({ color }: { color: string }): React.ReactElement {
   return (
-    <svg width={14} height={14} viewBox="0 0 16 16" fill="none" aria-hidden>
+    <svg width={15} height={15} viewBox="0 0 16 16" fill="none" aria-hidden>
       <circle cx={8} cy={8} r={6.2} stroke={color} strokeWidth={1.4} />
       <path d="M8 4.6V8l2.4 1.6" stroke={color} strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
@@ -357,7 +385,7 @@ function IconClock({ color }: { color: string }): React.ReactElement {
 
 function IconTarget({ color }: { color: string }): React.ReactElement {
   return (
-    <svg width={14} height={14} viewBox="0 0 16 16" fill="none" aria-hidden>
+    <svg width={15} height={15} viewBox="0 0 16 16" fill="none" aria-hidden>
       <circle cx={8} cy={8} r={6.2} stroke={color} strokeWidth={1.4} />
       <circle cx={8} cy={8} r={2.6} stroke={color} strokeWidth={1.4} />
     </svg>
@@ -366,7 +394,7 @@ function IconTarget({ color }: { color: string }): React.ReactElement {
 
 function IconCoin({ color }: { color: string }): React.ReactElement {
   return (
-    <svg width={14} height={14} viewBox="0 0 16 16" fill="none" aria-hidden>
+    <svg width={15} height={15} viewBox="0 0 16 16" fill="none" aria-hidden>
       <circle cx={8} cy={8} r={6.2} stroke={color} strokeWidth={1.4} />
       <path d="M5.6 4.8 8 7.6l2.4-2.8M8 7.6v3.8M6.2 9.4h3.6M6.2 11h3.6" stroke={color} strokeWidth={1.2} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
@@ -389,8 +417,8 @@ class DashboardBoundary extends Component<{ children: ReactNode }, { error: stri
   override render(): ReactNode {
     if (this.state.error !== null) {
       return (
-        <div style={styles.card}>
-          <p style={styles.error} role="status">统计面板渲染出错：{this.state.error}</p>
+        <div className="dsp-card">
+          <p className="dsp-error" role="status">统计面板渲染出错：{this.state.error}</p>
         </div>
       )
     }
@@ -420,6 +448,22 @@ export function StatsView(): React.ReactElement {
   const abortRef = useRef<AbortController | null>(null)
   /** Monotonic request identity; protects against fetch implementations that ignore abort. */
   const requestIdRef = useRef(0)
+  /** Dashboard root — anchor for resetting the shared conversation scrollport. */
+  const pageRef = useRef<HTMLDivElement | null>(null)
+
+  /**
+   * The shell renders every conversation view inside one shared scrollport
+   * (`[data-conversation-scroll]`) and chat leaves it pinned to the bottom.
+   * Without this reset the dashboard mounts at that offset and the user lands
+   * on the last table row. The layout effect runs before paint, so the first
+   * painted frame is already the top; {@link dashboardCss} additionally makes
+   * this view its own scrollport, which keeps the shared one from scrolling
+   * at all while the dashboard is active.
+   */
+  useLayoutEffect(() => {
+    const scroller = pageRef.current?.closest('[data-conversation-scroll]')
+    if (scroller instanceof HTMLElement) scroller.scrollTop = 0
+  }, [])
 
   /**
    * `silent` = background poll: never flashes the spinner or surfaces a
@@ -495,24 +539,25 @@ export function StatsView(): React.ReactElement {
   const hasData = stats !== null
 
   return (
-    <div style={styles.page}>
+    <div className="dsp-root" ref={pageRef}>
       <style>{dashboardCss}</style>
-      <div style={styles.frame}>
-        <header style={styles.head}>
-          <div>
-            <div style={styles.headTitle}>Token 使用统计</div>
-            <div style={styles.headSub}>模型用量 · 缓存命中率 · 渠道余量 · 费用估算（人民币）</div>
+      <div className="dsp-frame">
+        <header className="dsp-header">
+          <div className="dsp-header-copy">
+            <h1 className="dsp-title">Token 使用统计</h1>
+            <p className="dsp-subtitle">模型用量 · 缓存命中率 · 渠道余量 · 费用估算（人民币）</p>
           </div>
-          <div style={styles.headActions}>
+          <div className="dsp-header-actions">
             {error !== null && hasData ? (
-              <span style={styles.headError}>刷新失败 · {error}</span>
+              <span className="dsp-head-error">刷新失败 · {error}</span>
             ) : null}
             {updatedAt !== null ? (
-              <span style={styles.headUpdated}>
+              <span className="dsp-updated">
+                <span className="dsp-live-dot" aria-hidden />
                 更新于 {new Date(updatedAt).toLocaleTimeString()}{loading ? ' · 刷新中…' : ''}
               </span>
             ) : null}
-            <button type="button" className="dsp-btn" style={styles.button} onClick={refresh} disabled={loading}>
+            <button type="button" className="dsp-btn" onClick={refresh} disabled={loading}>
               <span className={loading ? 'dsp-spin' : undefined} style={styles.buttonGlyph}>⟳</span>
               刷新
             </button>
@@ -520,10 +565,10 @@ export function StatsView(): React.ReactElement {
         </header>
 
         {!hasData && error !== null ? (
-          <div style={styles.card}>
-            <p style={styles.error} role="status">
+          <div className="dsp-card">
+            <p className="dsp-error" role="status">
               <span>无法加载统计数据：{error}。请确认 dsh 服务运行正常后重试。</span>
-              <button type="button" className="dsp-btn" style={styles.button} onClick={refresh}>重试</button>
+              <button type="button" className="dsp-btn dsp-btn-primary" onClick={refresh}>重试</button>
             </p>
           </div>
         ) : null}
@@ -532,7 +577,7 @@ export function StatsView(): React.ReactElement {
 
         {hasData ? (
           <DashboardBoundary>
-            <div className="dsp-fade">
+            <div className="dsp-fade dsp-stack">
               <MemoKpiRow stats={stats} prices={prices} dayKey={dayKey} />
               <MemoChartsRow stats={stats} />
               <MemoBalancesCard refreshKey={refreshKey} />
@@ -548,16 +593,16 @@ export function StatsView(): React.ReactElement {
 /** First-paint placeholder mirroring the dashboard layout with shimmer blocks. */
 function SkeletonDashboard(): React.ReactElement {
   return (
-    <div aria-hidden>
-      <div style={styles.kpiGrid}>
-        {[0, 1, 2, 3, 4].map(i => <div key={i} className="dsp-skel" style={{ height: 84 }} />)}
+    <div className="dsp-stack" aria-hidden>
+      <div className="dsp-kpi-grid">
+        {[0, 1, 2, 3, 4].map(i => <div key={i} className="dsp-skel" style={{ height: 108 }} />)}
       </div>
-      <div style={styles.chartsRow}>
-        <div className="dsp-skel" style={{ height: 330 }} />
-        <div className="dsp-skel" style={{ height: 330 }} />
+      <div className="dsp-charts">
+        <div className="dsp-skel" style={{ height: 358 }} />
+        <div className="dsp-skel" style={{ height: 358 }} />
       </div>
-      <div className="dsp-skel" style={{ height: 150, marginBottom: 12 }} />
-      <div className="dsp-skel" style={{ height: 280 }} />
+      <div className="dsp-skel" style={{ height: 172 }} />
+      <div className="dsp-skel" style={{ height: 300 }} />
     </div>
   )
 }
@@ -587,7 +632,7 @@ function KpiRow({ stats, prices, dayKey }: { stats: StatsSummary; prices: PriceT
   }
 
   return (
-    <div style={styles.kpiGrid}>
+    <div className="dsp-kpi-grid">
       <KpiCard accent={COLOR_INPUT} icon={<IconPulse color={COLOR_INPUT} />} label="总调用次数"
         value={stats.totalCalls.toLocaleString()}
         sub={today !== undefined ? `今日 ${today.calls.toLocaleString()} 次` : '今日暂无调用'} />
@@ -601,11 +646,11 @@ function KpiRow({ stats, prices, dayKey }: { stats: StatsSummary; prices: PriceT
           : '今天还没有调用'}
         title="按服务端配置的日历分桶（默认主机本地时区，可用 settings.yaml 的 stats-panel.dayBoundary 改为 utc）"
         chip={dayChip} />
-      <KpiCard accent="#20c997" icon={<IconTarget color="#20c997" />} label="缓存命中率"
+      <KpiCard accent="#5fb3b3" icon={<IconTarget color="#5fb3b3" />} label="缓存命中率"
         value={`${stats.cacheHitRate.toFixed(1)}%`}
         sub={`读 ${formatTokens(stats.totalCacheReadTokens)} / 写 ${formatTokens(stats.totalCacheWriteTokens)}`}
         title="缓存读 ÷ 提示侧总量（未命中输入 + 缓存读 + 缓存写），与 DSH 会话内命中率口径一致；输出 token 不计入" />
-      <KpiCard accent="#ff922b" icon={<IconCoin color="#ff922b" />} label="估算费用"
+      <KpiCard accent="#d8a657" icon={<IconCoin color="#d8a657" />} label="估算费用"
         value={formatCny(totalCost)}
         sub={unconfigured > 0 ? `${unconfigured} 个模型价格待配置` : '按价格表计算'} />
     </div>
@@ -615,8 +660,8 @@ function KpiRow({ stats, prices, dayKey }: { stats: StatsSummary; prices: PriceT
 /** Day-over-day delta pill (newapi-style trend chip). */
 function TrendChip({ text, up }: { text: string; up: boolean }): React.ReactElement {
   return (
-    <span style={{ ...styles.trendChip, color: up ? '#ff922b' : '#51cf66' }}>
-      <span style={styles.trendArrow}>{up ? '↑' : '↓'}</span>{text}
+    <span className={`dsp-trend ${up ? 'is-up' : 'is-down'}`}>
+      <span aria-hidden>{up ? '↑' : '↓'}</span>{text}
     </span>
   )
 }
@@ -631,16 +676,14 @@ function KpiCard({ accent, icon, label, value, sub, title, chip }: {
   chip?: React.ReactNode
 }): React.ReactElement {
   return (
-    <div style={styles.kpiCard} title={title}>
-      <div style={styles.kpiLabelRow}>
-        <span style={{ ...styles.kpiIconChip, background: `color-mix(in srgb, ${accent} 16%, transparent)` }}>
-          {icon}
-        </span>
-        <span style={styles.kpiLabel}>{label}</span>
-        {chip !== undefined ? <span style={styles.kpiChipSeat}>{chip}</span> : null}
+    <div className="dsp-kpi" title={title} style={{ '--dsp-kpi-accent': accent } as React.CSSProperties}>
+      <div className="dsp-kpi-top">
+        <span className="dsp-kpi-icon">{icon}</span>
+        <span className="dsp-kpi-label">{label}</span>
+        {chip !== undefined ? <span className="dsp-kpi-chip">{chip}</span> : null}
       </div>
-      <div style={styles.kpiValue}>{value}</div>
-      {sub !== undefined && sub !== '' ? <div style={styles.kpiSub}>{sub}</div> : null}
+      <div className="dsp-kpi-value">{value}</div>
+      {sub !== undefined && sub !== '' ? <div className="dsp-kpi-sub">{sub}</div> : null}
     </div>
   )
 }
@@ -649,7 +692,7 @@ function KpiCard({ accent, icon, label, value, sub, title, chip }: {
 
 function ChartsRow({ stats }: { stats: StatsSummary }): React.ReactElement {
   return (
-    <div className="dsp-charts" style={styles.chartsRow}>
+    <div className="dsp-charts">
       <TrendCard stats={stats} />
       <ShareCard stats={stats} />
     </div>
@@ -674,18 +717,28 @@ function TrendCard({ stats }: { stats: StatsSummary }): React.ReactElement {
   // Round the axis maximum up to a tidy value so gridline labels stay readable.
   const axisMax = niceMax(max)
   const gridFractions = [0.25, 0.5, 0.75, 1]
+  const rangeTotal = days.reduce((sum, d) => sum + d.totalTokens, 0)
+  const rangeCalls = days.reduce((sum, d) => sum + d.calls, 0)
+  const averageLabel = active === 'day' ? '日均' : active === 'week' ? '周均' : '月均'
 
   return (
-    <div style={{ ...styles.card, minWidth: 0 }}>
-      <div style={styles.cardHead}>
-        <span style={styles.cardTitle}>Token 消耗趋势</span>
-        <div style={styles.segmented}>
+    <div className="dsp-card">
+      <div className="dsp-card-head">
+        <div className="dsp-card-title-wrap">
+          <span className="dsp-card-title">Token 消耗趋势</span>
+          <span className="dsp-legend">
+            <LegendDot color={COLOR_INPUT} text="输入" />
+            <LegendDot color={COLOR_OUTPUT} text="输出" />
+            <LegendDot color={COLOR_CACHE} text="缓存" />
+          </span>
+        </div>
+        <div className="dsp-seg">
           {(['day', 'week', 'month'] as const).map(p => (
             <button
               key={p}
               type="button"
-              className="dsp-seg"
-              style={{ ...styles.segmentButton, ...(p === active ? styles.segmentButtonActive : {}) }}
+              className="dsp-seg-btn"
+              aria-pressed={p === active}
               disabled={series[p].length === 0}
               onClick={() => { setPeriod(p) }}
             >
@@ -694,24 +747,19 @@ function TrendCard({ stats }: { stats: StatsSummary }): React.ReactElement {
           ))}
         </div>
       </div>
-      <div style={styles.legendRow}>
-        <LegendDot color={COLOR_INPUT} text="输入" />
-        <LegendDot color={COLOR_OUTPUT} text="输出" />
-        <LegendDot color={COLOR_CACHE} text="缓存" />
-      </div>
       {days.length === 0 ? (
-        <p style={styles.muted}>暂无消耗数据</p>
+        <div className="dsp-empty">暂无消耗数据</div>
       ) : (
         <>
-          <div style={styles.plot} onMouseLeave={() => { setHover(null) }}>
-            <div style={styles.plotGrid}>
+          <div className="dsp-plot" onMouseLeave={() => { setHover(null) }}>
+            <div className="dsp-plot-grid" aria-hidden>
               {gridFractions.map(f => (
-                <div key={f} style={{ ...styles.plotLine, bottom: `${f * 100}%` }}>
-                  <span style={styles.plotLineLabel}>{formatTokens(axisMax * f)}</span>
+                <div key={f} className="dsp-plot-line" style={{ bottom: `${f * 100}%` }}>
+                  <span className="dsp-plot-line-label">{formatTokens(axisMax * f)}</span>
                 </div>
               ))}
             </div>
-            <div style={styles.barRow}>
+            <div className="dsp-bars">
               {days.map((day, i) => {
                 const segments: Array<[string, number]> = [
                   [COLOR_INPUT, day.inputTokens],
@@ -719,18 +767,18 @@ function TrendCard({ stats }: { stats: StatsSummary }): React.ReactElement {
                   [COLOR_CACHE, day.cacheReadTokens + day.cacheWriteTokens],
                 ]
                 return (
-                  <div key={day.date} style={styles.barCol}>
+                  <div key={day.date} className="dsp-bar-col">
                     <div
-                      style={{ ...styles.barZone, ...(hover === i ? styles.barZoneHover : {}) }}
+                      className={`dsp-bar-zone${hover === i ? ' is-hover' : ''}`}
                       role="img"
                       aria-label={`${day.date} · ${formatTokens(day.totalTokens)} tokens · ${day.calls} 次调用`}
                       onMouseEnter={() => { setHover(i) }}
                     >
                       {segments.map(([color, n]) => (
-                        <div key={color} style={{ ...styles.barSeg, background: color, height: `${(n / axisMax) * 100}%` }} />
+                        <div key={color} className="dsp-bar-seg" style={{ background: color, height: `${(n / axisMax) * 100}%` }} />
                       ))}
                     </div>
-                    <div style={styles.barLabel}>{formatBucketLabel(day.date, active)}</div>
+                    <div className="dsp-bar-label">{formatBucketLabel(day.date, active)}</div>
                   </div>
                 )
               })}
@@ -739,15 +787,21 @@ function TrendCard({ stats }: { stats: StatsSummary }): React.ReactElement {
               <TrendTooltip day={days[hover]} calls={days[hover].calls} left={((hover + 0.5) / days.length) * 100} />
             ) : null}
           </div>
-          <div style={styles.trendFooter}>
-            范围内合计 <b>{formatTokens(days.reduce((s, d) => s + d.totalTokens, 0))}</b>
-            <span style={styles.trendFooterSep}>·</span>
-            {days.reduce((s, d) => s + d.calls, 0).toLocaleString()} 次调用
-            <span style={styles.trendFooterSep}>·</span>
-            {active === 'day' ? '日均 ' : active === 'week' ? '周均 ' : '月均 '}
-            {formatTokens(days.reduce((s, d) => s + d.totalTokens, 0) / days.length)}
+          <div className="dsp-stat-strip">
+            <div className="dsp-stat">
+              <span className="dsp-stat-label">范围内合计</span>
+              <span className="dsp-stat-value">{formatTokens(rangeTotal)}</span>
+            </div>
+            <div className="dsp-stat">
+              <span className="dsp-stat-label">调用次数</span>
+              <span className="dsp-stat-value">{rangeCalls.toLocaleString()}</span>
+            </div>
+            <div className="dsp-stat">
+              <span className="dsp-stat-label">{averageLabel}</span>
+              <span className="dsp-stat-value">{formatTokens(rangeTotal / days.length)}</span>
+            </div>
           </div>
-          {stats.bucketNotice !== undefined ? <div style={styles.bucketNotice}>{stats.bucketNotice}</div> : null}
+          {stats.bucketNotice !== undefined ? <div className="dsp-notice">{stats.bucketNotice}</div> : null}
         </>
       )}
     </div>
@@ -773,63 +827,70 @@ function TrendTooltip({ day, calls, left }: { day: DailyStats; calls: number; le
     ['缓存', day.cacheReadTokens + day.cacheWriteTokens, COLOR_CACHE],
   ]
   return (
-    <div style={{ ...styles.trendTooltip, left: `${clamped}%` }} role="status">
-      <div style={styles.trendTooltipTitle}>{day.date} · {calls.toLocaleString()} 次调用</div>
+    <div className="dsp-tooltip" style={{ left: `${clamped}%` }} role="status">
+      <div className="dsp-tooltip-title">{day.date} · {calls.toLocaleString()} 次调用</div>
       {rows.map(([label, tokens, color]) => (
-        <div key={label} style={styles.trendTooltipRow}>
-          <span style={{ ...styles.legendDot, background: color }} />
+        <div key={label} className="dsp-tooltip-row">
+          <span className="dsp-dot" style={{ background: color }} />
           <span>{label}</span>
-          <b style={styles.trendTooltipValue}>{formatTokens(tokens)}</b>
+          <b className="dsp-tooltip-value">{formatTokens(tokens)}</b>
         </div>
       ))}
-      <div style={styles.trendTooltipTotal}>共 {formatTokens(day.totalTokens)} tokens</div>
+      <div className="dsp-tooltip-total">共 {formatTokens(day.totalTokens)} tokens</div>
     </div>
   )
 }
 
 function LegendDot({ color, text }: { color: string; text: string }): React.ReactElement {
   return (
-    <span style={styles.legendItem}>
-      <span style={{ ...styles.legendDot, background: color }} />
-      <span style={styles.legendText}>{text}</span>
+    <span className="dsp-legend-item">
+      <span className="dsp-dot" style={{ background: color }} />
+      <span>{text}</span>
     </span>
   )
 }
 
-/** Share card: donut of total tokens by model with a top-8 legend. */
+/** Share card: donut of total tokens by model with a top-7 legend. */
 function ShareCard({ stats }: { stats: StatsSummary }): React.ReactElement {
   const data = [...stats.modelStats].sort((a, b) => b.totalTokens - a.totalTokens)
   const total = data.reduce((sum, m) => sum + m.totalTokens, 0)
-  const top = data.slice(0, 8)
+  const top = data.slice(0, 7)
+  const topTotal = top.reduce((sum, m) => sum + m.totalTokens, 0)
+  const rest = Math.max(0, total - topTotal)
 
   return (
-    <div style={{ ...styles.card, minWidth: 0 }}>
-      <div style={styles.cardHead}>
-        <span style={styles.cardTitle}>模型使用占比</span>
+    <div className="dsp-card">
+      <div className="dsp-card-head">
+        <span className="dsp-card-title">模型使用占比</span>
+        <span className="dsp-card-hint">按总 Token</span>
       </div>
       {top.length === 0 ? (
-        <p style={styles.muted}>暂无模型数据</p>
+        <div className="dsp-empty">暂无模型数据</div>
       ) : (
-        <div style={styles.shareBody}>
-          <div style={styles.donutBox}>
-            <svg viewBox="0 0 42 42" width={168} height={168}>
-              {renderDonutArcs(top, total)}
-              <circle cx={21} cy={21} r={9.5} style={{ fill: 'var(--dsw-alias-bg-layer-2, #1a1a1a)' }} />
-              <text x={21} y={20} textAnchor="middle" style={styles.donutValue}
-                fill="var(--dsw-alias-label-primary, #fff)">{formatTokens(total)}</text>
-              <text x={21} y={25} textAnchor="middle" style={styles.donutCaption}
-                fill="var(--dsw-alias-label-tertiary, #888)">总 Token</text>
-            </svg>
+        <div className="dsp-share">
+          <div className="dsp-donut" style={{ background: donutGradient(top, total, rest) }}>
+            <div className="dsp-donut-hole">
+              <div className="dsp-donut-value">{formatTokens(total)}</div>
+              <div className="dsp-donut-caption">总 Token</div>
+            </div>
           </div>
-          <div style={styles.shareLegend}>
+          <div className="dsp-share-legend">
             {top.map((m, i) => (
-              <div key={m.model} style={styles.shareLegendRow} title={m.model}>
-                <span style={{ ...styles.legendDot, background: CHART_COLORS[i % CHART_COLORS.length] }} />
-                <span style={styles.shareModel}>{m.model}</span>
-                <span style={styles.shareTokens}>{formatTokens(m.totalTokens)}</span>
-                <span style={styles.sharePct}>{total > 0 ? `${((m.totalTokens / total) * 100).toFixed(1)}%` : '0%'}</span>
+              <div key={m.model} className="dsp-share-row" title={m.model}>
+                <span className="dsp-dot" style={{ background: CHART_COLORS[i % CHART_COLORS.length] }} />
+                <span className="dsp-share-name">{m.model}</span>
+                <span className="dsp-share-tokens">{formatTokens(m.totalTokens)}</span>
+                <span className="dsp-share-pct">{total > 0 ? `${((m.totalTokens / total) * 100).toFixed(1)}%` : '0%'}</span>
               </div>
             ))}
+            {rest > 0 ? (
+              <div className="dsp-share-row" title={`其余 ${data.length - top.length} 个模型`}>
+                <span className="dsp-dot" style={{ background: COLOR_REST }} />
+                <span className="dsp-share-name">其他模型</span>
+                <span className="dsp-share-tokens">{formatTokens(rest)}</span>
+                <span className="dsp-share-pct">{total > 0 ? `${((rest / total) * 100).toFixed(1)}%` : '0%'}</span>
+              </div>
+            ) : null}
           </div>
         </div>
       )}
@@ -837,34 +898,22 @@ function ShareCard({ stats }: { stats: StatsSummary }): React.ReactElement {
   )
 }
 
-/** Donut wedges for the top models, drawn as pie paths behind the center hole. */
-function renderDonutArcs(top: ModelStats[], total: number): React.ReactElement[] {
-  let angle = -90
-  return top.map((m, i) => {
-    const share = total > 0 ? m.totalTokens / total : 0
-    const start = angle
-    const end = angle + share * 360
-    angle = end
-    const startRad = (start * Math.PI) / 180
-    const endRad = (end * Math.PI) / 180
-    const r = 16
-    const cx = 21
-    const cy = 21
-    const x1 = cx + r * Math.cos(startRad)
-    const y1 = cy + r * Math.sin(startRad)
-    const x2 = cx + r * Math.cos(endRad)
-    const y2 = cy + r * Math.sin(endRad)
-    const large = share > 0.5 ? 1 : 0
-    return (
-      <path
-        key={m.model}
-        d={`M${cx} ${cy} L${x1.toFixed(3)} ${y1.toFixed(3)} A${r} ${r} 0 ${large} 1 ${x2.toFixed(3)} ${y2.toFixed(3)} Z`}
-        fill={CHART_COLORS[i % CHART_COLORS.length]}
-        stroke="var(--dsw-alias-bg-layer-2, #1a1a1a)"
-        strokeWidth={0.6}
-      />
-    )
+/**
+ * CSS conic-gradient ring for the top models. The remainder (models outside
+ * the legend) becomes an explicit muted slice instead of an unexplained gap.
+ */
+function donutGradient(top: ModelStats[], total: number, rest: number): string {
+  if (total <= 0) return 'conic-gradient(var(--dsp-track) 0 100%)'
+  const stops: string[] = []
+  let acc = 0
+  top.forEach((m, i) => {
+    const start = (acc / total) * 100
+    acc += m.totalTokens
+    const end = (acc / total) * 100
+    stops.push(`${CHART_COLORS[i % CHART_COLORS.length]} ${start.toFixed(3)}% ${end.toFixed(3)}%`)
   })
+  if (rest > 0) stops.push(`${COLOR_REST} ${(acc / total * 100).toFixed(3)}% 100%`)
+  return `conic-gradient(${stops.join(', ')})`
 }
 
 /* --------------------------------------------------------- channel balances */
@@ -896,7 +945,7 @@ function BalancesCard({ refreshKey }: { refreshKey: number }): React.ReactElemen
   const [manual, setManual] = useState<Record<string, string>>(() => loadManualQuota())
   const [editing, setEditing] = useState<string | null>(null)
   const [draftNote, setDraftNote] = useState('')
-  /** In-flight balances fetch — aborted when superseded or unmounted. */
+  /** In-flight balances fetch — aborted when superseded/unmounted. */
   const abortRef = useRef<AbortController | null>(null)
   /** Monotonic request identity; abort alone is not sufficient for every fetch implementation. */
   const requestIdRef = useRef(0)
@@ -974,15 +1023,18 @@ function BalancesCard({ refreshKey }: { refreshKey: number }): React.ReactElemen
   }
 
   return (
-    <div style={styles.card}>
-      <div style={styles.cardHead}>
-        <span style={styles.cardTitle}>渠道余量 / 余额</span>
-        <span style={styles.cardHeadRight}>
-          {loading ? <span style={styles.mutedInline}>查询中…</span> : null}
-          <button type="button" className="dsp-btn" style={styles.button} onClick={() => { void load('foreground') }} disabled={loading}>刷新</button>
+    <div className="dsp-card">
+      <div className="dsp-card-head">
+        <div className="dsp-card-title-wrap">
+          <span className="dsp-card-title">渠道余量 / 余额</span>
+          <span className="dsp-card-hint">{rows.length} 个渠道</span>
+        </div>
+        <span className="dsp-card-actions">
+          {loading ? <span className="dsp-inline-muted">查询中…</span> : null}
+          <button type="button" className="dsp-btn" onClick={() => { void load('foreground') }} disabled={loading}>刷新</button>
         </span>
       </div>
-      <div style={styles.balanceGrid}>
+      <div className="dsp-balance-grid">
         {rows.map(row => (
           <BalanceRowCard key={row.channel} row={row}
             editing={editing} draftNote={draftNote}
@@ -996,6 +1048,12 @@ function BalancesCard({ refreshKey }: { refreshKey: number }): React.ReactElemen
   )
 }
 
+const BALANCE_KIND_LABEL: Record<ChannelBalance['kind'], string> = {
+  balance: '余额',
+  plan: '套餐',
+  manual: '手动',
+}
+
 function BalanceRowCard({ row, editing, draftNote, onEdit, onCancel, onDraft, onSave }: {
   row: ChannelBalance
   editing: string | null
@@ -1006,94 +1064,100 @@ function BalanceRowCard({ row, editing, draftNote, onEdit, onCancel, onDraft, on
   onSave: (channel: string) => void
 }): React.ReactElement {
   const ok = row.error === undefined && row.kind !== 'manual'
-  const statusColor = row.error !== undefined ? '#ff6b6b' : ok ? '#51cf66' : '#ffd43b'
+  const statusColor = row.error !== undefined ? 'var(--dsp-bad)' : ok ? 'var(--dsp-good)' : 'var(--dsp-warn)'
   return (
-    <div style={styles.balanceCard}>
-      <div style={styles.balanceHead}>
-        <span style={{ ...styles.statusDot, background: statusColor }} />
-        <span style={styles.balanceName} title={row.channel}>{row.displayName}</span>
+    <div className={`dsp-balance${row.error !== undefined ? ' is-error' : ''}`}>
+      <div className="dsp-balance-head">
+        <span className="dsp-status-dot" style={{ background: statusColor }} />
+        <span className="dsp-balance-name" title={row.channel}>{row.displayName}</span>
+        <span className="dsp-badge">{BALANCE_KIND_LABEL[row.kind]}</span>
       </div>
-      {row.error !== undefined ? (
-        <div style={styles.balanceError}>{row.error}</div>
-      ) : row.kind === 'balance' ? (
-        <div>
-          <div style={styles.balanceValue}>
-            {row.currency === 'CNY' ? '¥' : row.currency === 'USD' ? '$' : ''}{row.balance ?? '—'}
-          </div>
-          {row.note !== undefined ? <div style={styles.balanceNote}>{row.note}</div> : null}
-          {row.fetchedAt !== undefined ? (
-            <div style={styles.mutedInline}>查询于 {new Date(row.fetchedAt).toLocaleTimeString()}</div>
-          ) : null}
-        </div>
-      ) : row.kind === 'plan' && row.quota !== undefined ? (
-        <div>
-          {row.quota.map(q => {
-            const remainingMs = q.resetsAt !== '' ? new Date(q.resetsAt).getTime() - Date.now() : 0
-            const percent = Math.min(100, Math.max(0, q.percent))
-            return (
-              <div key={q.label} style={styles.quotaRow} title={`重置于 ${q.resetsAt}`}>
-                <div style={styles.quotaTop}>
-                  <span style={styles.quotaLabel}>{q.label}</span>
-                  <span style={styles.quotaText}>
+      <div className="dsp-balance-body">
+        {row.error !== undefined ? (
+          <div className="dsp-balance-error" title={row.error}>{row.error}</div>
+        ) : row.kind === 'balance' ? (
+          <>
+            <div className="dsp-balance-value">
+              {row.currency === 'CNY' ? '¥' : row.currency === 'USD' ? '$' : ''}{row.balance ?? '—'}
+            </div>
+            {row.note !== undefined ? <div className="dsp-balance-note" title={row.note}>{row.note}</div> : null}
+          </>
+        ) : row.kind === 'plan' && row.quota !== undefined ? (
+          <div className="dsp-quotas">
+            {row.quota.map(q => {
+              const remainingMs = q.resetsAt !== '' ? new Date(q.resetsAt).getTime() - Date.now() : 0
+              const percent = Math.min(100, Math.max(0, q.percent))
+              return (
+                <div key={q.label} className="dsp-quota" title={`重置于 ${q.resetsAt}`}>
+                  <div className="dsp-quota-top">
+                    <span className="dsp-quota-label">{q.label}</span>
+                    <span className="dsp-quota-pct">{q.percent}%</span>
+                  </div>
+                  <div className="dsp-quota-track">
+                    <span className="dsp-quota-fill" style={{ width: `${percent}%`, background: quotaColor(percent) }} />
+                  </div>
+                  <div className="dsp-quota-foot">
                     {q.used !== undefined && q.limit !== undefined
-                      ? `${formatTokens(q.used)} / ${formatTokens(q.limit)} · ${q.percent}%`
-                      : `${q.percent}%`}
+                      ? `已用 ${formatTokens(q.used)} / ${formatTokens(q.limit)}`
+                      : '额度'}
                     {q.resetsAt !== '' ? ` · 剩余 ${formatDuration(remainingMs)}` : ''}
-                  </span>
+                  </div>
                 </div>
-                <div style={styles.quotaBar}>
-                  <span style={{ ...styles.quotaFill, width: `${percent}%`, background: quotaColor(percent) }} />
+              )
+            })}
+          </div>
+        ) : row.kind === 'plan' && row.usage !== undefined ? (
+          <div className="dsp-quotas">
+            {row.usage.map(u => (
+              <div key={u.label} className="dsp-quota">
+                <div className="dsp-quota-top">
+                  <span className="dsp-quota-label">{u.label}</span>
+                </div>
+                <div className="dsp-quota-foot">输入 {formatTokens(u.inputTokens)} · 输出 {formatTokens(u.outputTokens)}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <>
+            {editing === row.channel ? (
+              <div className="dsp-manual-edit">
+                <input
+                  className="dsp-input"
+                  type="text"
+                  placeholder="如：剩余 18天 3小时 或 4100M Credits"
+                  value={draftNote}
+                  onChange={e => { onDraft(e.target.value) }}
+                />
+                <div className="dsp-manual-actions">
+                  <button type="button" className="dsp-btn dsp-btn-primary" onClick={() => { onSave(row.channel) }}>保存</button>
+                  <button type="button" className="dsp-btn" onClick={onCancel}>取消</button>
                 </div>
               </div>
-            )
-          })}
-        </div>
-      ) : row.kind === 'plan' && row.usage !== undefined ? (
-        <div>
-          {row.usage.map(u => (
-            <div key={u.label} style={styles.quotaRow}>
-              <div style={styles.quotaTop}>
-                <span style={styles.quotaLabel}>{u.label}</span>
-                <span style={styles.quotaText}>输入 {formatTokens(u.inputTokens)} · 输出 {formatTokens(u.outputTokens)}</span>
+            ) : (
+              <div className="dsp-manual">
+                <span className="dsp-manual-value">{row.note !== undefined && row.note !== '' ? row.note : '待配置'}</span>
+                <button type="button" className="dsp-btn" onClick={() => { onEdit(row.channel) }}>
+                  {row.note !== undefined && row.note !== '' ? '修改' : '配置'}
+                </button>
               </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div>
-          {editing === row.channel ? (
-            <div style={styles.manualEdit}>
-              <input
-                className="dsp-input"
-                style={styles.input}
-                type="text"
-                placeholder="如：剩余 18天 3小时 或 4100M Credits"
-                value={draftNote}
-                onChange={e => { onDraft(e.target.value) }}
-              />
-              <button type="button" className="dsp-btn-p" style={styles.buttonPrimary} onClick={() => { onSave(row.channel) }}>保存</button>
-              <button type="button" className="dsp-btn" style={styles.button} onClick={onCancel}>取消</button>
-            </div>
-          ) : (
-            <div style={styles.manualRow}>
-              <span style={styles.balanceValue}>{row.note !== undefined && row.note !== '' ? row.note : '待配置'}</span>
-              <button type="button" className="dsp-btn" style={styles.button} onClick={() => { onEdit(row.channel) }}>
-                {row.note !== undefined && row.note !== '' ? '修改' : '配置'}
-              </button>
-            </div>
-          )}
-          <div style={styles.mutedInline}>无公开查询 API，请到平台控制台查看后填写</div>
-        </div>
-      )}
+            )}
+          </>
+        )}
+      </div>
+      {row.error !== undefined ? null : row.kind === 'balance' && row.fetchedAt !== undefined ? (
+        <div className="dsp-balance-foot">查询于 {new Date(row.fetchedAt).toLocaleTimeString()}</div>
+      ) : row.kind === 'manual' ? (
+        <div className="dsp-balance-foot">无公开查询 API，请到平台控制台查看后填写</div>
+      ) : null}
     </div>
   )
 }
 
 /** Quota bar color: green when plenty remains, amber → red as usage climbs. */
 function quotaColor(percent: number): string {
-  if (percent >= 90) return '#ff6b6b'
-  if (percent >= 70) return '#ff922b'
-  return '#51cf66'
+  if (percent >= 90) return 'var(--dsp-bad)'
+  if (percent >= 70) return 'var(--dsp-warn)'
+  return 'var(--dsp-good)'
 }
 
 /* ------------------------------------------------------------ details card */
@@ -1107,7 +1171,7 @@ const DETAIL_TABS: Array<{ id: DetailTab; label: string }> = [
   { id: 'records', label: '调用记录' },
 ]
 
-/** Tabbed detail card: usage tables, price editor and recent records. */
+/** Tabbed detail card: usage breakdowns, price editor and recent records. */
 function DetailsCard({ stats, prices, onPricesChange }: {
   stats: StatsSummary
   prices: PriceTable
@@ -1124,15 +1188,15 @@ function DetailsCard({ stats, prices, onPricesChange }: {
   }
 
   return (
-    <div style={styles.card}>
-      <div style={styles.cardHead}>
-        <div style={styles.segmented}>
+    <div className="dsp-card">
+      <div className="dsp-card-head">
+        <div className="dsp-seg">
           {DETAIL_TABS.map(t => (
             <button
               key={t.id}
               type="button"
-              className="dsp-seg"
-              style={{ ...styles.segmentButton, ...(t.id === tab ? styles.segmentButtonActive : {}) }}
+              className="dsp-seg-btn"
+              aria-pressed={t.id === tab}
               onClick={() => { setTab(t.id) }}
             >
               {t.label}
@@ -1141,25 +1205,28 @@ function DetailsCard({ stats, prices, onPricesChange }: {
         </div>
         {tab === 'prices' ? (
           editing ? (
-            <span style={styles.cardHeadRight}>
-              <button type="button" className="dsp-btn" style={styles.button} onClick={() => { setDraft(null) }}>取消</button>
-              <button type="button" className="dsp-btn-p" style={styles.buttonPrimary} onClick={applyDraft}>保存</button>
+            <span className="dsp-card-actions">
+              <button type="button" className="dsp-btn" onClick={() => { setDraft(null) }}>取消</button>
+              <button type="button" className="dsp-btn dsp-btn-primary" onClick={applyDraft}>保存</button>
             </span>
           ) : (
-            <button type="button" className="dsp-btn" style={styles.button} onClick={() => { setDraft(toPriceDraft(prices)) }}>编辑价格</button>
+            <span className="dsp-card-actions">
+              <span className="dsp-card-hint">单位：元 / 1M tokens</span>
+              <button type="button" className="dsp-btn" onClick={() => { setDraft(toPriceDraft(prices)) }}>编辑价格</button>
+            </span>
           )
         ) : null}
       </div>
 
-      {tab === 'models' ? <ModelTable data={stats.modelStats} prices={prices} /> : null}
-      {tab === 'channels' ? <ChannelTable data={stats.channelStats} /> : null}
+      {tab === 'models' ? <ModelBreakdown data={stats.modelStats} prices={prices} /> : null}
+      {tab === 'channels' ? <ChannelBreakdown data={stats.channelStats} /> : null}
       {tab === 'prices' ? (
         <div>
-          <p style={styles.hint}>
+          <p className="dsp-hint">
             内置价格为官方牌价（人民币 元/1M tokens；美元模型按 ≈7.1 汇率折算），来源与生效时间见
-            <a href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing" target="_blank" rel="noreferrer" style={styles.link}> DeepSeek</a>、
-            <a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noreferrer" style={styles.link}> OpenAI</a>、
-            <a href="https://www.anthropic.com/claude/opus/5" target="_blank" rel="noreferrer" style={styles.link}> Anthropic</a> 等官方页。
+            <a href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing" target="_blank" rel="noreferrer" className="dsp-link"> DeepSeek</a>、
+            <a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noreferrer" className="dsp-link"> OpenAI</a>、
+            <a href="https://www.anthropic.com/claude/opus/5" target="_blank" rel="noreferrer" className="dsp-link"> Anthropic</a> 等官方页。
             你编辑过的模型以你的价格为准；缺失模型自动用内置默认价补齐。
             套餐内模型（MiMo Token Plan）与免费模型（ox-alpha-free 等）计 0，避免与套餐/免费额度重复计费；
             DeepSeek 官方为峰谷计价（周一至五 9-12/14-18 为高峰），内置取高峰价、空闲时段实际减半；
@@ -1167,178 +1234,175 @@ function DetailsCard({ stats, prices, onPricesChange }: {
           </p>
           {editing && draft !== null
             ? <PriceEditor draft={draft} onChange={setDraft} models={stats.modelStats.map(m => m.model)} />
-            : <PriceTableCard rows={stats.modelStats.map(m => m.model)} prices={prices} />}
+            : <PriceList rows={stats.modelStats.map(m => m.model)} prices={prices} />}
         </div>
       ) : null}
-      {tab === 'records' ? <RecordsTable data={stats.recentRecords} prices={prices} /> : null}
+      {tab === 'records' ? <RecordsList data={stats.recentRecords} prices={prices} /> : null}
     </div>
   )
 }
 
-/* ----------------------------------------------------------------- tables */
+/* ------------------------------------------------------------------- lists */
 
-function ModelTable({ data, prices }: { data: ModelStats[]; prices: PriceTable }): React.ReactElement {
-  if (data.length === 0) return <p style={styles.muted}>暂无模型数据</p>
+/** Model breakdown as ranked rows — no spreadsheet grid, hierarchy per row. */
+function ModelBreakdown({ data, prices }: { data: ModelStats[]; prices: PriceTable }): React.ReactElement {
+  if (data.length === 0) return <div className="dsp-empty">暂无模型数据</div>
   const sorted = [...data].sort((a, b) => b.totalTokens - a.totalTokens)
   const total = sorted.reduce((sum, m) => sum + m.totalTokens, 0)
   return (
-    <div style={styles.tableScroll}>
-      <table className="dsp-table" style={styles.table}>
-        <thead>
-          <tr>
-            <th style={styles.th}>模型</th>
-            <th style={styles.th}>占比</th>
-            <th style={styles.thRight}>调用</th>
-            <th style={styles.thRight}>输入</th>
-            <th style={styles.thRight}>输出</th>
-            <th style={styles.thRight}>缓存读</th>
-            <th style={styles.thRight}>缓存写</th>
-            <th style={styles.thRight}>总 Token</th>
-            <th style={styles.thRight}>费用</th>
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((m, i) => {
-            const share = total > 0 ? (m.totalTokens / total) * 100 : 0
-            return (
-              <tr key={m.model}>
-                <td style={styles.td} title={m.model}>{m.model}</td>
-                <td style={styles.td}>
-                  <span className="dsp-sharebar" style={styles.sharebar}>
-                    <span style={styles.sharebarTrack}>
-                      <span style={{
-                        ...styles.sharebarFill,
-                        width: `${Math.max(share, share > 0 ? 2 : 0)}%`,
-                        background: CHART_COLORS[i % CHART_COLORS.length],
-                      }} />
-                    </span>
-                    <span style={styles.sharebarText}>{share.toFixed(1)}%</span>
-                  </span>
-                </td>
-                <td style={styles.tdRight}>{m.calls.toLocaleString()}</td>
-                <td style={styles.tdRight}>{formatTokens(m.inputTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(m.outputTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(m.cacheReadTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(m.cacheWriteTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(m.totalTokens)}</td>
-                <td style={{ ...styles.tdRight, color: 'var(--dsw-alias-state-warn-label, #ffd43b)' }}>
-                  {formatCny(modelCost(m, prices[m.model]))}
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+    <div className="dsp-rows">
+      {sorted.map((m, i) => {
+        const share = total > 0 ? (m.totalTokens / total) * 100 : 0
+        const price = prices[m.model]
+        return (
+          <div key={m.model} className="dsp-row">
+            <div className="dsp-row-main">
+              <div className="dsp-row-title">
+                <span className="dsp-rank">{i + 1}</span>
+                <span className="dsp-row-name" title={m.model}>{m.model}</span>
+                {price === undefined ? <span className="dsp-tag is-warn">价格待配置</span> : null}
+              </div>
+              <div className="dsp-row-sub">
+                <span>{m.calls.toLocaleString()} 次调用</span>
+                <span className="dsp-sep">·</span>
+                <span>输入 {formatTokens(m.inputTokens)}</span>
+                <span className="dsp-sep">·</span>
+                <span>输出 {formatTokens(m.outputTokens)}</span>
+                <span className="dsp-sep">·</span>
+                <span>缓存 {formatTokens(m.cacheReadTokens + m.cacheWriteTokens)}</span>
+              </div>
+            </div>
+            <div className="dsp-row-share">
+              <div className="dsp-track">
+                <span style={{
+                  display: 'block',
+                  height: '100%',
+                  borderRadius: 999,
+                  width: `${Math.max(share, share > 0 ? 2 : 0)}%`,
+                  background: CHART_COLORS[i % CHART_COLORS.length],
+                }} />
+              </div>
+              <span className="dsp-track-pct">{share.toFixed(1)}%</span>
+            </div>
+            <div className="dsp-metric">
+              <span className="dsp-metric-value">{formatTokens(m.totalTokens)}</span>
+              <span className="dsp-metric-label">总 Token</span>
+            </div>
+            <div className="dsp-metric is-cost">
+              <span className="dsp-metric-value">{formatCny(modelCost(m, price))}</span>
+              <span className="dsp-metric-label">估算费用</span>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
 
-function ChannelTable({ data }: { data: ChannelStats[] }): React.ReactElement {
-  if (data.length === 0) return <p style={styles.muted}>暂无渠道数据</p>
+/** Channel breakdown with the same ranked-row language as the model list. */
+function ChannelBreakdown({ data }: { data: ChannelStats[] }): React.ReactElement {
+  if (data.length === 0) return <div className="dsp-empty">暂无渠道数据</div>
   const sorted = [...data].sort((a, b) => b.totalTokens - a.totalTokens)
   const total = sorted.reduce((sum, c) => sum + c.totalTokens, 0)
   return (
-    <div style={styles.tableScroll}>
-      <table className="dsp-table" style={styles.table}>
-        <thead>
-          <tr>
-            <th style={styles.th}>渠道</th>
-            <th style={styles.th}>占比</th>
-            <th style={styles.thRight}>调用</th>
-            <th style={styles.thRight}>输入</th>
-            <th style={styles.thRight}>输出</th>
-            <th style={styles.thRight}>缓存</th>
-            <th style={styles.thRight}>总 Token</th>
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((c, i) => {
-            const share = total > 0 ? (c.totalTokens / total) * 100 : 0
-            return (
-              <tr key={c.channel}>
-                <td style={styles.td}>
-                  <div style={styles.channelName}>{channelName(c.channel)}</div>
-                  <div style={styles.channelModels} title={c.models.join(', ')}>{c.models.join(', ')}</div>
-                </td>
-                <td style={styles.td}>
-                  <span className="dsp-sharebar" style={styles.sharebar}>
-                    <span style={styles.sharebarTrack}>
-                      <span style={{
-                        ...styles.sharebarFill,
-                        width: `${Math.max(share, share > 0 ? 2 : 0)}%`,
-                        background: CHART_COLORS[i % CHART_COLORS.length],
-                      }} />
-                    </span>
-                    <span style={styles.sharebarText}>{share.toFixed(1)}%</span>
-                  </span>
-                </td>
-                <td style={styles.tdRight}>{c.calls.toLocaleString()}</td>
-                <td style={styles.tdRight}>{formatTokens(c.inputTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(c.outputTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(c.cacheReadTokens + c.cacheWriteTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(c.totalTokens)}</td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+    <div className="dsp-rows">
+      {sorted.map((c, i) => {
+        const share = total > 0 ? (c.totalTokens / total) * 100 : 0
+        return (
+          <div key={c.channel} className="dsp-row">
+            <div className="dsp-row-main">
+              <div className="dsp-row-title">
+                <span className="dsp-rank">{i + 1}</span>
+                <span className="dsp-row-name">{channelName(c.channel)}</span>
+              </div>
+              <div className="dsp-row-sub">
+                <span>输入 {formatTokens(c.inputTokens)}</span>
+                <span className="dsp-sep">·</span>
+                <span>输出 {formatTokens(c.outputTokens)}</span>
+                <span className="dsp-sep">·</span>
+                <span>缓存 {formatTokens(c.cacheReadTokens + c.cacheWriteTokens)}</span>
+              </div>
+              <div className="dsp-row-sub dsp-row-models" title={c.models.join(', ')}>
+                {c.models.join(' · ')}
+              </div>
+            </div>
+            <div className="dsp-row-share">
+              <div className="dsp-track">
+                <span style={{
+                  display: 'block',
+                  height: '100%',
+                  borderRadius: 999,
+                  width: `${Math.max(share, share > 0 ? 2 : 0)}%`,
+                  background: CHART_COLORS[i % CHART_COLORS.length],
+                }} />
+              </div>
+              <span className="dsp-track-pct">{share.toFixed(1)}%</span>
+            </div>
+            <div className="dsp-metric">
+              <span className="dsp-metric-value">{formatTokens(c.totalTokens)}</span>
+              <span className="dsp-metric-label">总 Token</span>
+            </div>
+            <div className="dsp-metric">
+              <span className="dsp-metric-value">{c.calls.toLocaleString()}</span>
+              <span className="dsp-metric-label">调用次数</span>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
 
-function RecordsTable({ data, prices }: { data: UsageRecord[]; prices: PriceTable }): React.ReactElement {
-  if (data.length === 0) return <p style={styles.muted}>暂无调用记录（历史明细已折叠为总量统计，各项数字不受影响）</p>
+/** Recent calls as a compact timeline list instead of a wide table. */
+function RecordsList({ data, prices }: { data: UsageRecord[]; prices: PriceTable }): React.ReactElement {
+  if (data.length === 0) return <div className="dsp-empty">暂无调用记录（历史明细已折叠为总量统计，各项数字不受影响）</div>
   return (
-    <div style={styles.tableScroll}>
-      <div style={styles.recordsScroll}>
-        <table className="dsp-table" style={styles.table}>
-          <thead>
-            <tr>
-              <th style={styles.th}>时间</th>
-              <th style={styles.th}>渠道</th>
-              <th style={styles.th}>模型</th>
-              <th style={styles.thRight}>输入</th>
-              <th style={styles.thRight}>输出</th>
-              <th style={styles.thRight}>缓存</th>
-              <th style={styles.thRight}>总 Token</th>
-              <th style={styles.thRight}>费用</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.slice(0, 100).map(r => (
-              <tr key={`${r.sessionId}-${r.seq}`}>
-                <td style={styles.td}>{new Date(r.ts).toLocaleString()}</td>
-                <td style={styles.td}>{channelName(r.provider)}</td>
-                <td style={styles.td} title={r.model}>{r.model}</td>
-                <td style={styles.tdRight}>{formatTokens(r.inputTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(r.outputTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(r.cacheReadTokens + r.cacheWriteTokens)}</td>
-                <td style={styles.tdRight}>{formatTokens(r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens)}</td>
-                <td style={styles.tdRight}>
-                  {formatCny(modelCost(
-                    {
-                      model: r.model,
-                      calls: 1,
-                      inputTokens: r.inputTokens,
-                      outputTokens: r.outputTokens,
-                      cacheReadTokens: r.cacheReadTokens,
-                      cacheWriteTokens: r.cacheWriteTokens,
-                      reasoningTokens: r.reasoningTokens,
-                      totalTokens: r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens,
-                    },
-                    prices[r.model],
-                  ))}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+    <div className="dsp-records">
+      {data.slice(0, 100).map(r => {
+        const total = r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens
+        const cost = modelCost(
+          {
+            model: r.model,
+            calls: 1,
+            inputTokens: r.inputTokens,
+            outputTokens: r.outputTokens,
+            cacheReadTokens: r.cacheReadTokens,
+            cacheWriteTokens: r.cacheWriteTokens,
+            reasoningTokens: r.reasoningTokens,
+            totalTokens: total,
+          },
+          prices[r.model],
+        )
+        return (
+          <div key={`${r.sessionId}-${r.seq}`} className="dsp-record">
+            <div className="dsp-record-time">{formatRecordTime(r.ts)}</div>
+            <div className="dsp-record-main">
+              <div className="dsp-record-model" title={r.model}>{r.model}</div>
+              <div className="dsp-record-sub">
+                <span className="dsp-tag">{channelName(r.provider)}</span>
+                <span>输入 {formatTokens(r.inputTokens)}</span>
+                <span className="dsp-sep">·</span>
+                <span>输出 {formatTokens(r.outputTokens)}</span>
+                <span className="dsp-sep">·</span>
+                <span>缓存 {formatTokens(r.cacheReadTokens + r.cacheWriteTokens)}</span>
+              </div>
+            </div>
+            <div className="dsp-metric">
+              <span className="dsp-metric-value">{formatTokens(total)}</span>
+              <span className="dsp-metric-label">总 Token</span>
+            </div>
+            <div className="dsp-metric is-cost">
+              <span className="dsp-metric-value">{formatCny(cost)}</span>
+              <span className="dsp-metric-label">费用</span>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
 
-/* ------------------------------------------------------------ price table */
+/* ------------------------------------------------------------ price editor */
 
 /** String-form price draft: controlled number inputs swallow the "." while
  * typing (`Number("0.") → 0` rewrites the field), so edits stay textual until
@@ -1346,6 +1410,13 @@ function RecordsTable({ data, prices }: { data: UsageRecord[]; prices: PriceTabl
 type PriceDraftTable = Record<string, Record<keyof ModelPrice, string>>
 
 const PRICE_FIELDS: Array<keyof ModelPrice> = ['inputPerM', 'outputPerM', 'cacheReadPerM', 'cacheWritePerM']
+
+const PRICE_FIELD_LABELS: Record<keyof ModelPrice, string> = {
+  inputPerM: '输入',
+  outputPerM: '输出',
+  cacheReadPerM: '缓存命中',
+  cacheWritePerM: '缓存写入',
+}
 
 function toPriceDraft(prices: PriceTable): PriceDraftTable {
   const draft: PriceDraftTable = {}
@@ -1373,45 +1444,38 @@ function draftToPrices(draft: PriceDraftTable): PriceTable {
   return prices
 }
 
-function PriceTableCard({ rows, prices }: { rows: string[]; prices: PriceTable }): React.ReactElement {
-  if (rows.length === 0) return <p style={styles.muted}>暂无模型数据</p>
+/** Read-only price list: one settings-style row per model. */
+function PriceList({ rows, prices }: { rows: string[]; prices: PriceTable }): React.ReactElement {
+  if (rows.length === 0) return <div className="dsp-empty">暂无模型数据</div>
   return (
-    <div style={styles.tableScroll}>
-      <table className="dsp-table" style={styles.table}>
-        <thead>
-          <tr>
-            <th style={styles.th}>模型</th>
-            <th style={styles.thRight}>输入 元/1M</th>
-            <th style={styles.thRight}>输出 元/1M</th>
-            <th style={styles.thRight}>缓存命中 元/1M</th>
-            <th style={styles.thRight}>缓存写入 元/1M</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(model => {
-            const p = prices[model]
-            return (
-              <tr key={model}>
-                <td style={styles.td} title={model}>{model}</td>
-                {p === undefined
-                  ? <td style={styles.td} colSpan={4}><span style={styles.pending}>价格待配置（不计入费用）</span></td>
-                  : (
-                    <>
-                      <td style={styles.tdRight}>{p.inputPerM}</td>
-                      <td style={styles.tdRight}>{p.outputPerM}</td>
-                      <td style={styles.tdRight}>{p.cacheReadPerM}</td>
-                      <td style={styles.tdRight}>{p.cacheWritePerM}</td>
-                    </>
-                  )}
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+    <div className="dsp-price-list">
+      {rows.map(model => {
+        const p = prices[model]
+        return (
+          <div key={model} className="dsp-price-row">
+            <div className="dsp-price-model" title={model}>{model}</div>
+            {p === undefined ? (
+              <div className="dsp-price-fields">
+                <span className="dsp-tag is-warn">价格待配置（不计入费用）</span>
+              </div>
+            ) : (
+              <div className="dsp-price-fields">
+                {PRICE_FIELDS.map(field => (
+                  <div key={field} className="dsp-price-cell">
+                    <span className="dsp-price-label">{PRICE_FIELD_LABELS[field]}</span>
+                    <span className="dsp-price-value">{p[field]}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
 
+/** Editable price list — same row language, number inputs instead of values. */
 function PriceEditor({ draft, onChange, models }: {
   draft: PriceDraftTable
   onChange: (draft: PriceDraftTable) => void
@@ -1423,32 +1487,30 @@ function PriceEditor({ draft, onChange, models }: {
     onChange({ ...draft, [model]: row })
   }
   return (
-    <div style={styles.tableScroll}>
-      <table className="dsp-table" style={styles.table}>
-        <thead>
-          <tr>
-            <th style={styles.th}>模型</th>
-            <th style={styles.thRight}>输入 元/1M</th>
-            <th style={styles.thRight}>输出 元/1M</th>
-            <th style={styles.thRight}>缓存命中 元/1M</th>
-            <th style={styles.thRight}>缓存写入 元/1M</th>
-          </tr>
-        </thead>
-        <tbody>
-          {models.map(model => {
-            const p = draft[model] ?? { inputPerM: '0', outputPerM: '0', cacheReadPerM: '0', cacheWritePerM: '0' }
-            return (
-              <tr key={model}>
-                <td style={styles.td} title={model}>{model}</td>
-                <td style={styles.tdRight}><input className="dsp-input" style={styles.input} type="number" step="0.001" min="0" value={p.inputPerM} onChange={e => { set(model, 'inputPerM', e.target.value) }} /></td>
-                <td style={styles.tdRight}><input className="dsp-input" style={styles.input} type="number" step="0.001" min="0" value={p.outputPerM} onChange={e => { set(model, 'outputPerM', e.target.value) }} /></td>
-                <td style={styles.tdRight}><input className="dsp-input" style={styles.input} type="number" step="0.001" min="0" value={p.cacheReadPerM} onChange={e => { set(model, 'cacheReadPerM', e.target.value) }} /></td>
-                <td style={styles.tdRight}><input className="dsp-input" style={styles.input} type="number" step="0.001" min="0" value={p.cacheWritePerM} onChange={e => { set(model, 'cacheWritePerM', e.target.value) }} /></td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+    <div className="dsp-price-list">
+      {models.map(model => {
+        const p = draft[model] ?? { inputPerM: '0', outputPerM: '0', cacheReadPerM: '0', cacheWritePerM: '0' }
+        return (
+          <div key={model} className="dsp-price-row">
+            <div className="dsp-price-model" title={model}>{model}</div>
+            <div className="dsp-price-fields">
+              {PRICE_FIELDS.map(field => (
+                <label key={field} className="dsp-price-cell">
+                  <span className="dsp-price-label">{PRICE_FIELD_LABELS[field]}</span>
+                  <input
+                    className="dsp-input"
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    value={p[field]}
+                    onChange={e => { set(model, field, e.target.value) }}
+                  />
+                </label>
+              ))}
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -1468,397 +1530,316 @@ const MemoDetailsCard = React.memo(DetailsCard)
 /* ------------------------------------------------------------ stylesheets */
 
 /**
- * Hover/focus affordances and responsive collapse that inline styles cannot
- * express. All selectors are scoped under `.dsp-` classes owned by this view.
+ * Dashboard design system. Tokens ride the DSH alias variables so the panel
+ * follows the active theme (including custom skins) instead of hard-coding a
+ * palette; only the data series keep fixed, deliberately desaturated colours.
+ * All selectors are scoped under `.dsp-` classes owned by this view.
  */
 const dashboardCss = `
-.dsp-btn:hover:not(:disabled), .dsp-btn-p:hover:not(:disabled) { filter: brightness(1.2); }
-.dsp-btn:disabled, .dsp-btn-p:disabled { opacity: 0.5; cursor: default; }
-.dsp-table tbody tr:hover td { background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.08)); }
-.dsp-seg:hover:not(:disabled) { color: var(--dsw-alias-label-primary, #fff); }
-.dsp-input:focus { outline: none; border-color: var(--dsw-alias-state-business-primary, #4a9eff); }
+.dsp-root {
+  ${SERIES_VARS}
+  --dsp-card: var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.06));
+  --dsp-card-2: var(--dsw-alias-bg-layer-1, rgba(128,128,128,0.04));
+  --dsp-track: var(--dsw-alias-border-l1, rgba(128,128,128,0.2));
+  --dsp-border: var(--dsw-alias-border-l1, rgba(128,128,128,0.16));
+  --dsp-border-2: var(--dsw-alias-border-l2, rgba(128,128,128,0.24));
+  --dsp-text: var(--dsw-alias-label-primary, #f2f3f5);
+  --dsp-text-2: var(--dsw-alias-label-secondary, #a6acb8);
+  --dsp-text-3: var(--dsw-alias-label-tertiary, #7b828e);
+  --dsp-accent: var(--dsw-alias-state-business-primary, #5b8cff);
+  --dsp-good: #3ecf8e;
+  --dsp-warn: #e0a03c;
+  --dsp-bad: #ef5f6b;
+  height: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsp-text);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.dsp-root *, .dsp-root *::before, .dsp-root *::after { box-sizing: border-box; }
+
+/* Own the scrollport while this view is active: the shell renders every view
+   in one shared conversation scroller, and chat leaves it pinned to the
+   bottom. Making the view slot fill the remaining height means the shared
+   scroller never overflows, so the dashboard always starts at the top. */
+[data-slot="conversation.session"]:has(.dsp-root) > :has(> [data-slot="conversation.view"]) {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dsp-frame { max-width: 1240px; margin: 0 auto; padding: 22px 24px 36px; }
+.dsp-stack { display: flex; flex-direction: column; gap: 12px; }
+
+.dsp-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
+.dsp-title { margin: 0; font-size: 20px; line-height: 1.3; font-weight: 650; letter-spacing: -0.01em; color: var(--dsp-text); }
+.dsp-subtitle { margin: 5px 0 0; font-size: 12.5px; color: var(--dsp-text-3); }
+.dsp-header-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dsp-updated { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+.dsp-live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsp-good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsp-good) 16%, transparent); }
+.dsp-head-error { font-size: 12px; color: var(--dsp-bad); }
+
+.dsp-card {
+  background: var(--dsp-card);
+  border: 1px solid var(--dsp-border);
+  border-radius: 14px;
+  padding: 16px 18px;
+  min-width: 0;
+}
+.dsp-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+.dsp-card-title-wrap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0; }
+.dsp-card-title { font-size: 14px; font-weight: 600; color: var(--dsp-text); letter-spacing: 0.005em; }
+.dsp-card-hint { font-size: 11.5px; color: var(--dsp-text-3); }
+.dsp-card-actions { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.dsp-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 5px 12px; border-radius: 8px;
+  border: 1px solid var(--dsp-border-2);
+  background: transparent; color: var(--dsp-text-2);
+  cursor: pointer; font-size: 12px; line-height: 18px;
+  transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+}
+.dsp-btn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.12)); color: var(--dsp-text); }
+.dsp-btn:disabled { opacity: 0.5; cursor: default; }
+.dsp-btn-primary { background: var(--dsp-accent); border-color: transparent; color: #fff; }
+.dsp-btn-primary:hover:not(:disabled) { background: var(--dsp-accent); filter: brightness(1.08); color: #fff; }
+
+.dsp-seg {
+  display: inline-flex; gap: 2px; padding: 3px;
+  border-radius: 10px; background: var(--dsp-card-2);
+  border: 1px solid var(--dsp-border);
+}
+.dsp-seg-btn {
+  border: none; background: transparent; color: var(--dsp-text-3);
+  cursor: pointer; font-size: 12px; line-height: 18px;
+  padding: 5px 12px; border-radius: 7px; white-space: nowrap;
+  transition: background-color .15s ease, color .15s ease;
+}
+.dsp-seg-btn:hover:not(:disabled) { color: var(--dsp-text); }
+.dsp-seg-btn[aria-pressed="true"] { background: var(--dsw-alias-bg-layer-3, rgba(128,128,128,0.18)); color: var(--dsp-text); }
+.dsp-seg-btn:disabled { opacity: 0.4; cursor: default; }
+
+.dsp-kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(208px, 1fr)); gap: 12px; }
+.dsp-kpi {
+  position: relative; overflow: hidden;
+  background: var(--dsp-card); border: 1px solid var(--dsp-border);
+  border-radius: 14px; padding: 15px 16px 16px;
+}
+.dsp-kpi::after {
+  content: ''; position: absolute; top: -48px; right: -34px; width: 128px; height: 128px;
+  border-radius: 50%; background: var(--dsp-kpi-accent, var(--dsp-accent));
+  opacity: 0.09; pointer-events: none;
+}
+.dsp-kpi-top { position: relative; z-index: 1; display: flex; align-items: center; gap: 9px; }
+.dsp-kpi-icon {
+  width: 28px; height: 28px; border-radius: 9px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--dsp-kpi-accent, var(--dsp-accent)) 16%, transparent);
+}
+.dsp-kpi-label { font-size: 12.5px; font-weight: 500; color: var(--dsp-text-2); white-space: nowrap; }
+.dsp-kpi-chip { margin-left: auto; flex: none; }
+.dsp-kpi-value { position: relative; z-index: 1; margin-top: 12px; font-size: 26px; line-height: 1.1; font-weight: 700; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.dsp-kpi-sub { position: relative; z-index: 1; margin-top: 6px; font-size: 12px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+
+.dsp-trend { display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dsp-trend.is-up { color: #e0a03c; background: color-mix(in srgb, #e0a03c 14%, transparent); }
+.dsp-trend.is-down { color: #4ecb8d; background: color-mix(in srgb, #4ecb8d 14%, transparent); }
+
+.dsp-charts { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(300px, 1fr); gap: 12px; align-items: stretch; }
+.dsp-charts > .dsp-card { display: flex; flex-direction: column; }
+.dsp-charts > .dsp-card > .dsp-share { flex: 1; }
+
+.dsp-legend { display: inline-flex; align-items: center; gap: 12px; }
+.dsp-legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--dsp-text-2); }
+.dsp-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
+
+.dsp-plot { position: relative; height: 236px; }
+.dsp-plot-grid { position: absolute; inset: 16px 0 22px; }
+.dsp-plot-line { position: absolute; left: 0; right: 0; border-bottom: 1px solid var(--dsp-border); }
+.dsp-plot-line-label { position: absolute; left: 0; top: -15px; font-size: 10px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+.dsp-bars { position: absolute; inset: 16px 0 22px; display: flex; gap: 7px; align-items: stretch; }
+.dsp-bar-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.dsp-bar-zone { flex: 1; display: flex; flex-direction: column-reverse; border-radius: 5px; overflow: hidden; transition: filter .15s ease; }
+.dsp-bar-zone.is-hover { filter: brightness(1.16); }
+.dsp-bar-seg { width: 100%; }
+.dsp-bar-label { height: 22px; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--dsp-text-3); white-space: nowrap; overflow: hidden; }
+
+.dsp-tooltip {
+  position: absolute; top: 4px; transform: translateX(-50%); z-index: 5; pointer-events: none;
+  background: var(--dsw-alias-bg-layer-2, #1f1f1f); border: 1px solid var(--dsp-border-2);
+  border-radius: 10px; padding: 8px 11px; box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+  font-size: 11.5px; color: var(--dsp-text-2); white-space: nowrap;
+}
+.dsp-tooltip-title { color: var(--dsp-text); font-weight: 600; margin-bottom: 5px; }
+.dsp-tooltip-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+.dsp-tooltip-value { margin-left: auto; padding-left: 12px; color: var(--dsp-text); font-variant-numeric: tabular-nums; }
+.dsp-tooltip-total { margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--dsp-border); color: var(--dsp-text); }
+
+.dsp-stat-strip { display: flex; gap: 0; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsp-border); }
+.dsp-stat { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 0 14px; border-left: 1px solid var(--dsp-border); }
+.dsp-stat:first-child { padding-left: 0; border-left: none; }
+.dsp-stat-label { font-size: 11px; color: var(--dsp-text-3); }
+.dsp-stat-value { font-size: 14px; font-weight: 600; color: var(--dsp-text); font-variant-numeric: tabular-nums; }
+.dsp-notice { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--dsp-border-2); font-size: 11px; line-height: 1.6; color: var(--dsp-text-3); }
+
+.dsp-share { display: flex; flex-direction: column; align-items: stretch; gap: 16px; }
+.dsp-donut {
+  width: 152px; height: 152px; border-radius: 50%; flex: none; align-self: center;
+  display: grid; place-items: center;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--dsp-border) 60%, transparent);
+}
+.dsp-donut-hole {
+  width: 64%; height: 64%; border-radius: 50%; background: var(--dsp-card);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+}
+.dsp-donut-value { font-size: 17px; font-weight: 700; color: var(--dsp-text); font-variant-numeric: tabular-nums; }
+.dsp-donut-caption { font-size: 10.5px; color: var(--dsp-text-3); }
+.dsp-share-legend { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.dsp-share-row { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; }
+.dsp-share-name { flex: 1; min-width: 0; color: var(--dsp-text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsp-share-tokens { color: var(--dsp-text); font-variant-numeric: tabular-nums; flex: none; }
+.dsp-share-pct { width: 46px; text-align: right; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; flex: none; }
+
+.dsp-balance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 10px; align-items: stretch; }
+.dsp-balance {
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--dsp-card-2); border: 1px solid var(--dsp-border);
+  border-radius: 12px; padding: 13px 14px; min-width: 0;
+}
+.dsp-balance.is-error { border-color: color-mix(in srgb, var(--dsp-bad) 38%, var(--dsp-border)); }
+.dsp-balance-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dsp-status-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.dsp-balance-name { font-size: 12.5px; font-weight: 600; color: var(--dsp-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsp-badge {
+  margin-left: auto; flex: none; font-size: 10.5px; line-height: 16px; padding: 0 7px;
+  border-radius: 999px; color: var(--dsp-text-3); border: 1px solid var(--dsp-border-2);
+}
+.dsp-balance-body { display: flex; flex-direction: column; gap: 8px; }
+.dsp-balance-value { font-size: 20px; font-weight: 700; color: var(--dsp-text); font-variant-numeric: tabular-nums; }
+.dsp-balance-note { font-size: 11.5px; line-height: 1.6; color: var(--dsp-text-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.dsp-balance-error {
+  font-size: 11.5px; line-height: 1.6; color: var(--dsp-bad);
+  background: color-mix(in srgb, var(--dsp-bad) 10%, transparent);
+  border-radius: 8px; padding: 8px 10px;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.dsp-balance-foot { margin-top: auto; padding-top: 2px; font-size: 10.5px; color: var(--dsp-text-3); }
+
+.dsp-quotas { display: flex; flex-direction: column; gap: 12px; }
+.dsp-quota { display: flex; flex-direction: column; gap: 5px; }
+.dsp-quota-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.dsp-quota-label { font-size: 11.5px; color: var(--dsp-text-2); }
+.dsp-quota-pct { font-size: 13px; font-weight: 600; color: var(--dsp-text); font-variant-numeric: tabular-nums; }
+.dsp-quota-track { height: 6px; border-radius: 999px; background: var(--dsp-track); overflow: hidden; }
+.dsp-quota-fill { display: block; height: 100%; border-radius: 999px; transition: width .3s ease; }
+.dsp-quota-foot { font-size: 10.5px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+
+.dsp-manual { display: flex; align-items: center; gap: 10px; }
+.dsp-manual-value { flex: 1; min-width: 0; font-size: 13px; color: var(--dsp-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsp-manual-edit { display: flex; flex-direction: column; gap: 8px; }
+.dsp-manual-actions { display: flex; gap: 8px; }
+.dsp-input {
+  width: 100%; padding: 6px 9px; border-radius: 8px;
+  border: 1px solid var(--dsp-border-2); background: var(--dsw-alias-bg-base, rgba(0,0,0,0.18));
+  color: var(--dsp-text); font-size: 12.5px; font-variant-numeric: tabular-nums;
+  font-family: inherit;
+}
+.dsp-input::placeholder { color: var(--dsp-text-3); }
+.dsp-input:focus { outline: none; border-color: var(--dsp-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsp-accent) 18%, transparent); }
+
+.dsp-rows { display: flex; flex-direction: column; }
+.dsp-row {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  margin: 0 -10px; padding: 13px 10px; border-radius: 10px;
+  transition: background-color .12s ease;
+}
+.dsp-row + .dsp-row { box-shadow: inset 0 1px 0 var(--dsp-border); }
+.dsp-row:hover { background: color-mix(in srgb, var(--dsp-accent) 5%, transparent); }
+.dsp-row-main { flex: 1 1 260px; min-width: 0; }
+.dsp-row-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dsp-rank { width: 18px; flex: none; font-size: 11px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+.dsp-row-name { font-size: 13.5px; font-weight: 600; color: var(--dsp-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsp-row-sub { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 4px; font-size: 11.5px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+.dsp-row-sub.dsp-row-models { margin-top: 2px; color: var(--dsp-text-3); opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+.dsp-sep { opacity: 0.5; }
+.dsp-row-share { flex: 0 1 168px; min-width: 120px; display: flex; align-items: center; gap: 9px; }
+.dsp-track { flex: 1; height: 6px; border-radius: 999px; background: var(--dsp-track); overflow: hidden; min-width: 32px; }
+.dsp-track-pct { width: 44px; flex: none; text-align: right; font-size: 11.5px; color: var(--dsp-text-2); font-variant-numeric: tabular-nums; }
+.dsp-metric { min-width: 80px; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.dsp-metric-value { font-size: 14.5px; font-weight: 600; color: var(--dsp-text); font-variant-numeric: tabular-nums; }
+.dsp-metric-label { font-size: 10.5px; color: var(--dsp-text-3); }
+.dsp-metric.is-cost .dsp-metric-value { color: var(--dsp-warn); }
+
+.dsp-tag { flex: none; font-size: 10.5px; line-height: 16px; padding: 0 7px; border-radius: 999px; color: var(--dsp-text-3); background: var(--dsp-card-2); border: 1px solid var(--dsp-border); }
+.dsp-tag.is-warn { color: var(--dsp-warn); border-color: color-mix(in srgb, var(--dsp-warn) 35%, transparent); background: color-mix(in srgb, var(--dsp-warn) 10%, transparent); }
+
+.dsp-records { display: flex; flex-direction: column; max-height: 460px; overflow-y: auto; padding-right: 4px; }
+.dsp-record {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  margin: 0 -10px; padding: 11px 10px; border-radius: 10px;
+  transition: background-color .12s ease;
+}
+.dsp-record + .dsp-record { box-shadow: inset 0 1px 0 var(--dsp-border); }
+.dsp-record:hover { background: color-mix(in srgb, var(--dsp-accent) 5%, transparent); }
+.dsp-record-time { flex: none; width: 104px; font-size: 11.5px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+.dsp-record-main { flex: 1 1 240px; min-width: 0; }
+.dsp-record-model { font-size: 13px; font-weight: 600; color: var(--dsp-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsp-record-sub { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 11px; color: var(--dsp-text-3); font-variant-numeric: tabular-nums; }
+
+.dsp-price-list { display: flex; flex-direction: column; }
+.dsp-price-row {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  margin: 0 -10px; padding: 10px; border-radius: 10px;
+}
+.dsp-price-row + .dsp-price-row { box-shadow: inset 0 1px 0 var(--dsp-border); }
+.dsp-price-row:hover { background: color-mix(in srgb, var(--dsp-accent) 4%, transparent); }
+.dsp-price-model { flex: 1 1 200px; min-width: 0; font-size: 13px; font-weight: 600; color: var(--dsp-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsp-price-fields { flex: 1 1 420px; display: grid; grid-template-columns: repeat(4, minmax(74px, 1fr)); gap: 8px; }
+.dsp-price-cell { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.dsp-price-label { font-size: 10.5px; color: var(--dsp-text-3); }
+.dsp-price-value { font-size: 13px; font-weight: 600; color: var(--dsp-text); font-variant-numeric: tabular-nums; padding: 3px 0; }
+
+.dsp-hint { margin: 0 0 14px; font-size: 11.5px; line-height: 1.75; color: var(--dsp-text-3); max-width: 104ch; }
+.dsp-link { color: var(--dsp-accent); text-decoration: none; }
+.dsp-link:hover { text-decoration: underline; }
+.dsp-empty { padding: 26px 0; text-align: center; font-size: 12.5px; color: var(--dsp-text-3); }
+.dsp-inline-muted { font-size: 11.5px; color: var(--dsp-text-3); }
+.dsp-error { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0; font-size: 12.5px; color: var(--dsp-bad); }
+
+.dsp-fade { animation: dspFade 0.25s ease; }
+@keyframes dspFade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @keyframes dspShimmer { from { background-position: 400px 0; } to { background-position: -400px 0; } }
 .dsp-skel {
+  border-radius: 14px;
   background: linear-gradient(90deg,
     var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.08)) 25%,
-    rgba(128,128,128,0.2) 50%,
+    rgba(128,128,128,0.18) 50%,
     var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.08)) 75%);
   background-size: 800px 100%;
   animation: dspShimmer 1.2s linear infinite;
-  border-radius: 12px;
 }
 @keyframes dspSpin { to { transform: rotate(360deg); } }
 .dsp-spin { display: inline-block; animation: dspSpin 0.9s linear infinite; }
-@keyframes dspFade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-.dsp-fade { animation: dspFade 0.25s ease; }
-@media (prefers-reduced-motion: reduce) {
-  .dsp-skel, .dsp-spin, .dsp-fade { animation: none; }
+@media (prefers-reduced-motion: reduce) { .dsp-skel, .dsp-spin, .dsp-fade { animation: none; } }
+@media (max-width: 1080px) {
+  .dsp-charts { grid-template-columns: 1fr; }
 }
-@media (max-width: 980px) {
-  .dsp-charts { grid-template-columns: 1fr !important; }
+@media (max-width: 640px) {
+  .dsp-frame { padding: 18px 14px 32px; }
+  .dsp-metric { min-width: 68px; }
 }
 `
 
 /* ----------------------------------------------------------------- styles */
 
-const card: React.CSSProperties = {
-  background: 'var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.06))',
-  border: '1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.22))',
-  borderRadius: 12,
-  padding: 16,
-}
-
-const buttonBase: React.CSSProperties = {
-  padding: '4px 12px',
-  borderRadius: 6,
-  border: '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.3))',
-  background: 'transparent',
-  color: 'var(--dsw-alias-label-primary, #eee)',
-  cursor: 'pointer',
-  fontSize: 12,
-  lineHeight: '18px',
-}
-
-const segmentButton: React.CSSProperties = {
-  padding: '4px 12px',
-  borderRadius: 6,
-  border: 'none',
-  background: 'transparent',
-  color: 'var(--dsw-alias-label-secondary, #999)',
-  cursor: 'pointer',
-  fontSize: 12,
-  lineHeight: '18px',
-  whiteSpace: 'nowrap',
-}
-
+/** Only dynamic one-offs stay inline; everything visual lives in the scoped CSS. */
 const styles: Record<string, React.CSSProperties> = {
-  // The view area hands us a definite-height flex child; scroll internally.
-  page: {
-    height: '100%',
-    minHeight: 0,
-    overflowY: 'auto',
-    boxSizing: 'border-box',
-    background: 'var(--dsw-alias-bg-layer-1, transparent)',
-  },
-  frame: { maxWidth: 1280, margin: '0 auto', padding: '20px 24px 40px', boxSizing: 'border-box' },
-
-  head: { display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 12, marginBottom: 14, flexWrap: 'wrap' },
-  headTitle: { fontSize: 20, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #fff)' },
-  headSub: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #999)', marginTop: 3 },
-  headActions: { display: 'flex', alignItems: 'center', gap: 10 },
-  headUpdated: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #888)' },
-  headError: { fontSize: 12, color: '#ff6b6b' },
   buttonGlyph: { display: 'inline-block', marginRight: 4 },
-
-  button: buttonBase,
-  buttonPrimary: {
-    ...buttonBase,
-    border: '1px solid var(--dsw-alias-state-business-primary, #4a9eff)',
-    background: 'var(--dsw-alias-state-business-primary, #4a9eff)',
-    color: '#fff',
-  },
-
-  kpiGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 12 },
-  kpiCard: { ...card, padding: '12px 14px' },
-  kpiLabelRow: { display: 'flex', alignItems: 'center', gap: 8 },
-  kpiIconChip: {
-    width: 26,
-    height: 26,
-    borderRadius: 8,
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexShrink: 0,
-  },
-  kpiChipSeat: { marginLeft: 'auto' },
-  kpiLabel: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #999)' },
-  kpiValue: {
-    fontSize: 24,
-    fontWeight: 700,
-    marginTop: 8,
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    fontVariantNumeric: 'tabular-nums',
-  },
-  kpiSub: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #888)', marginTop: 3 },
-  trendChip: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: 2,
-    fontSize: 11,
-    fontWeight: 600,
-    fontVariantNumeric: 'tabular-nums',
-    whiteSpace: 'nowrap',
-  },
-  trendArrow: { fontSize: 10 },
-
-  chartsRow: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(0, 1fr)', gap: 12, marginBottom: 12 },
-
-  card,
-  cardHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 10, flexWrap: 'wrap' },
-  cardHeadRight: { display: 'flex', alignItems: 'center', gap: 8 },
-  cardTitle: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #fff)' },
-
-  segmented: {
-    display: 'inline-flex',
-    gap: 2,
-    padding: 2,
-    borderRadius: 8,
-    background: 'var(--dsw-alias-bg-layer-1, rgba(128,128,128,0.1))',
-    border: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.15))',
-  },
-  segmentButton,
-  segmentButtonActive: {
-    background: 'var(--dsw-alias-interactive-bg-hover-solid, rgba(128,128,128,0.22))',
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    borderRadius: 6,
-  },
-
-  legendRow: { display: 'flex', gap: 14, marginBottom: 6 },
-  legendItem: { display: 'inline-flex', alignItems: 'center', gap: 5 },
-  legendDot: { width: 9, height: 9, borderRadius: 2, flexShrink: 0, display: 'inline-block' },
-  legendText: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #999)' },
-
-  plot: { position: 'relative', height: 240 },
-  plotGrid: { position: 'absolute', inset: '18px 0 22px 0' },
-  plotLine: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    borderBottom: '1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,0.18))',
-  },
-  plotLineLabel: {
-    position: 'absolute',
-    left: 0,
-    top: -14,
-    fontSize: 10,
-    color: 'var(--dsw-alias-label-tertiary, #777)',
-    fontVariantNumeric: 'tabular-nums',
-  },
-  barRow: {
-    position: 'absolute',
-    inset: '18px 0 22px 0',
-    display: 'flex',
-    gap: 6,
-    alignItems: 'stretch',
-  },
-  barCol: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' },
-  barZone: {
-    flex: 1,
-    display: 'flex',
-    flexDirection: 'column-reverse',
-    alignItems: 'stretch',
-    borderRadius: 3,
-    overflow: 'hidden',
-  },
-  barSeg: { width: '100%' },
-  barZoneHover: { filter: 'brightness(1.15)' },
-  trendTooltip: {
-    position: 'absolute',
-    top: 6,
-    transform: 'translateX(-50%)',
-    zIndex: 5,
-    pointerEvents: 'none',
-    background: 'var(--dsw-alias-bg-layer-2, #1f1f1f)',
-    border: '1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.25))',
-    borderRadius: 8,
-    padding: '7px 10px',
-    boxShadow: '0 4px 16px rgba(0,0,0,0.25)',
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-secondary, #999)',
-    whiteSpace: 'nowrap',
-  },
-  trendTooltipTitle: { color: 'var(--dsw-alias-label-primary, #fff)', fontWeight: 600, marginBottom: 4 },
-  trendTooltipRow: { display: 'flex', alignItems: 'center', gap: 5, margin: '1px 0' },
-  trendTooltipValue: {
-    marginLeft: 'auto',
-    paddingLeft: 8,
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    fontVariantNumeric: 'tabular-nums',
-  },
-  trendTooltipTotal: {
-    marginTop: 3,
-    paddingTop: 3,
-    borderTop: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.18))',
-    color: 'var(--dsw-alias-label-primary, #eee)',
-  },
-  barLabel: {
-    height: 22,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: 10,
-    color: 'var(--dsw-alias-label-tertiary, #888)',
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-  },
-  trendFooter: {
-    marginTop: 8,
-    paddingTop: 8,
-    borderTop: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.14))',
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-secondary, #999)',
-    display: 'flex',
-    alignItems: 'baseline',
-    gap: 6,
-    flexWrap: 'wrap',
-    fontVariantNumeric: 'tabular-nums',
-  },
-  trendFooterSep: { color: 'var(--dsw-alias-label-tertiary, #777)' },
-
-  shareBody: { display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' },
-  donutBox: { flexShrink: 0 },
-  donutValue: { fontSize: 7.5, fontWeight: 700 },
-  donutCaption: { fontSize: 3.6 },
-  shareLegend: { flex: 1, minWidth: 150, display: 'flex', flexDirection: 'column', gap: 6 },
-  shareLegendRow: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, minWidth: 0 },
-  shareModel: {
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  shareTokens: {
-    marginLeft: 'auto',
-    color: 'var(--dsw-alias-label-secondary, #999)',
-    fontVariantNumeric: 'tabular-nums',
-    flexShrink: 0,
-  },
-  sharePct: {
-    color: 'var(--dsw-alias-label-tertiary, #888)',
-    fontVariantNumeric: 'tabular-nums',
-    flexShrink: 0,
-    width: 44,
-    textAlign: 'right',
-  },
-
-  balanceGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: 10 },
-  balanceCard: {
-    background: 'var(--dsw-alias-bg-layer-1, rgba(128,128,128,0.05))',
-    border: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.16))',
-    borderRadius: 10,
-    padding: '10px 12px',
-    minWidth: 0,
-  },
-  balanceHead: { display: 'flex', alignItems: 'center', gap: 7, marginBottom: 6 },
-  statusDot: { width: 7, height: 7, borderRadius: '50%', flexShrink: 0 },
-  balanceName: {
-    fontSize: 12,
-    fontWeight: 600,
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  balanceValue: {
-    fontSize: 18,
-    fontWeight: 700,
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    fontVariantNumeric: 'tabular-nums',
-    marginRight: 8,
-  },
-  balanceError: { fontSize: 12, color: '#ff6b6b', wordBreak: 'break-all' },
-  balanceNote: {
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-secondary, #999)',
-    marginTop: 2,
-    lineHeight: 1.5,
-    wordBreak: 'break-word',
-  },
-  quotaRow: { margin: '6px 0' },
-  quotaTop: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, marginBottom: 3 },
-  quotaLabel: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #999)', flexShrink: 0 },
-  quotaText: { fontSize: 11, color: 'var(--dsw-alias-label-primary, #eee)', fontVariantNumeric: 'tabular-nums', textAlign: 'right' },
-  quotaBar: { height: 6, borderRadius: 3, background: 'var(--dsw-alias-border-l1, rgba(128,128,128,0.18))', overflow: 'hidden' },
-  quotaFill: { display: 'block', height: '100%', borderRadius: 3, transition: 'width 0.3s ease' },
-  manualRow: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 },
-  manualEdit: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 },
-
-  table: { width: '100%', borderCollapse: 'collapse', fontSize: 12 },
-  sharebar: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: 8,
-    minWidth: 0,
-    maxWidth: 160,
-    width: '100%',
-  },
-  sharebarTrack: {
-    flex: 1,
-    height: 5,
-    borderRadius: 3,
-    background: 'var(--dsw-alias-border-l1, rgba(128,128,128,0.18))',
-    overflow: 'hidden',
-    minWidth: 24,
-  },
-  sharebarFill: {
-    display: 'block',
-    height: '100%',
-    borderRadius: 3,
-  },
-  sharebarText: {
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-secondary, #999)',
-    fontVariantNumeric: 'tabular-nums',
-    flexShrink: 0,
-    width: 42,
-    textAlign: 'right',
-  },
-  th: {
-    padding: '7px 8px',
-    textAlign: 'left',
-    borderBottom: '1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.22))',
-    color: 'var(--dsw-alias-label-tertiary, #888)',
-    fontWeight: 500,
-    fontSize: 11,
-    whiteSpace: 'nowrap',
-  },
-  td: {
-    padding: '7px 8px',
-    borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.14))',
-    color: 'var(--dsw-alias-label-primary, #eee)',
-    maxWidth: 220,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  tableScroll: { overflowX: 'auto', maxWidth: '100%' },
-  recordsScroll: { maxHeight: 360, overflowY: 'auto' },
-  channelName: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #fff)' },
-  channelModels: {
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-tertiary, #888)',
-    maxWidth: 200,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-
-  hint: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #999)', margin: '4px 0 10px', lineHeight: 1.6 },
-  link: { color: 'var(--dsw-alias-state-business-primary, #4a9eff)' },
-  muted: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #999)', margin: '10px 0' },
-  bucketNotice: {
-    fontSize: 11,
-    lineHeight: 1.5,
-    color: 'var(--dsw-alias-label-secondary, #999)',
-    marginTop: 6,
-    paddingTop: 6,
-    borderTop: '1px dashed var(--dsw-alias-separator, rgba(128,128,128,.25))',
-  },
-  mutedInline: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #888)' },
-  error: { fontSize: 12, color: '#ff6b6b', margin: '10px 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
-  pending: { color: '#ffd43b', fontSize: 11 },
-  input: {
-    width: 84,
-    padding: '3px 6px',
-    borderRadius: 5,
-    border: '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.3))',
-    background: 'var(--dsw-alias-bg-base, rgba(0,0,0,0.2))',
-    color: 'var(--dsw-alias-label-primary, #fff)',
-    fontSize: 12,
-    boxSizing: 'border-box',
-  },
 }
-
-// Right-aligned numeric columns derive from the base cells.
-styles.thRight = { ...styles.th, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
-styles.tdRight = { ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }

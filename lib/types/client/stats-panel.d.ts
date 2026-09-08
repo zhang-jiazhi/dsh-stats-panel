@@ -12,6 +12,12 @@
  * DeepSeek's official CNY peak-hour prices effective 2026-08-29 (source:
  * https://api-docs.deepseek.com/zh-cn/quick_start/pricing).
  *
+ * Scroll ownership: the shell renders every view tab inside one shared
+ * conversation scrollport whose chat half is pinned to the bottom. This view
+ * resets that scrollport to the top on mount and — via the `:has()` rules in
+ * {@link dashboardCss} — becomes its own scrollport, so the shared one never
+ * scrolls while the dashboard is active.
+ *
  * All rendering is contained: any fetch/render failure renders an inline
  * error card instead of throwing out of the view.
  */

@@ -9,7 +9,8 @@
  * problems are contained inside the view, never thrown — an external plugin
  * must not take the GUI down.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { StatsView } from './stats-panel'
 
 /** Required services (fiber inject waiting — the runtime must be up first). */

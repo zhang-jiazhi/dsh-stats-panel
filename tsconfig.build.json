@@ -7,6 +7,7 @@
     "outDir": "./lib/types",
     "rootDir": "./src",
     "noEmit": false,
+    "emitDeclarationOnly": true,
     "allowImportingTsExtensions": false,
     "module": "ESNext",
     "moduleResolution": "bundler",

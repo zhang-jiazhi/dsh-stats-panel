@@ -278,7 +278,7 @@ describe('host data integrity', () => {
       },
     }
     const persistence = {
-      listSnapshots: async () => [{ header: { id }, revision }],
+      list: async () => [{ header: { id }, revision }],
     }
 
     const first = mount(query, persistence)
@@ -314,7 +314,7 @@ describe('host data integrity', () => {
         return { events }
       },
     }
-    const first = mount(query, { listSnapshots: async () => [{ header: { id }, revision: 'r1' }] })
+    const first = mount(query, { list: async () => [{ header: { id }, revision: 'r1' }] })
     await settle()
     expect(reads).toBe(1)
 
@@ -336,7 +336,7 @@ describe('host data integrity', () => {
         return { events: [sessionHeaderEvent('model', 'provider', 0, Date.now()), usageEvent(1, 8, 1)] }
       },
     }
-    const harness = mount(query, { listSnapshots: async () => [{ header: { id }, revision: 'r1' }] })
+    const harness = mount(query, { list: async () => [{ header: { id }, revision: 'r1' }] })
     await settle()
     expect(reads).toBe(1)
     expect((await readSummary(harness)).totalCalls).toBe(1)

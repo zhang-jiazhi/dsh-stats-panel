@@ -1852,9 +1852,9 @@ export function apply(ctx: Context): void {
       const state = loadBackfillState()
       let snapshots: Map<string, string> | null = null
       try {
-        const persistence = ctx.get('sessionPersistence') as { listSnapshots?: () => Promise<unknown> } | undefined
-        if (typeof persistence?.listSnapshots === 'function') {
-          const listed = await persistence.listSnapshots()
+        const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<unknown> } | undefined
+        if (typeof persistence?.list === 'function') {
+          const listed = await persistence.list()
           if (Array.isArray(listed)) {
             const next = new Map<string, string>()
             for (const value of listed) {

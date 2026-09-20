@@ -69,7 +69,7 @@ Cookie 过期后重新登录平台并更新该文件即可。
 | MiMo Token Plan | 套餐用量 | `platform.xiaomimimo.com/api/v1/tokenPlan/usage`（需登录 Cookie） | — |
 
 > OpenAI / Anthropic 用量接口需要组织级（admin）API Key，普通项目 Key 可能返回 403。
-> 渠道自动发现：读取 `~/.dsh/settings.yaml` 中 `llm-pi-ai.providers` 与 `llm-deepseek` 配置，按 baseURL 匹配查询方式；凭据通过 DSH credentials 服务按 `apiKeyEnv` 解析。
+> 渠道自动发现：读取 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers`，按 baseURL 匹配查询方式；`llm-deepseek` 段只有模型目录/重试策略，不参与发现；`deepseek-official` 仅当 `DEEPSEEK_API_KEY` 凭据可解析时自动加入探测列表。凭据通过 DSH credentials 服务按 `apiKeyEnv` 解析。
 
 ## 计价
 

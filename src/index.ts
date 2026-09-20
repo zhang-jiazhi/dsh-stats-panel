@@ -25,7 +25,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -36,7 +37,12 @@ export const name = 'stats-panel'
 export const inject = ['webServer']
 
 /** Where the durable usage log lives. */
-const DATA_DIR = join(homedir(), '.dsh', 'stats-panel')
+/**
+ * DSH_HOME 优先，其次 ~/.dsh（与宿主 @deepseek-ai/dsh-home-paths 的语义一致）。
+ * 原实现硬编码 homedir()，DSH_HOME 被覆盖时数据会写到错误位置。
+ */
+const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
+const DATA_DIR = join(DSH_HOME, 'stats-panel')
 const RECORDS_FILE = join(DATA_DIR, 'records.jsonl')
 
 /**
@@ -49,6 +55,16 @@ const ARCHIVE_FILE = join(DATA_DIR, 'archive.json')
 
 /** Persisted session revisions used to skip unchanged backfill work. */
 const BACKFILL_STATE_FILE = join(DATA_DIR, 'backfill-state.json')
+
+/**
+ * Compaction lock — an O_EXCL create over this file serializes compactions
+ * across host processes sharing DATA_DIR. A lock older than the staleness
+ * window was left by a crashed holder and may be taken over.
+ */
+const COMPACT_LOCK_FILE = join(DATA_DIR, 'compact.lock')
+
+/** Age at which a compaction lock is treated as abandoned by its holder. */
+const COMPACT_LOCK_STALE_MS = 60_000
 
 /** Default compaction trigger (records in memory). */
 const COMPACT_MAX_RECORDS_DEFAULT = 10_000
@@ -133,16 +149,26 @@ export interface ChannelStats {
 /** One channel's account status (balance or plan quota), fetched by the balances route. */
 export interface ChannelBalance {
   channel: string
-  /** 'balance' = pay-as-you-go balance; 'plan' = subscription quota; 'manual' = user-entered. */
-  kind: 'balance' | 'plan' | 'manual'
+  /**
+   * 'balance' = pay-as-you-go balance; 'plan' = subscription quota;
+   * 'manual' = user-entered; 'error' = the probe itself failed (deadline or
+   * exception) — the round-1 audit found these hardcoded as 'plan', which
+   * rendered a「套餐」badge on a failed query.
+   */
+  kind: 'balance' | 'plan' | 'manual' | 'error'
   displayName: string
   /** Balance amount (balance kind). */
   balance?: string
   currency?: string
   /** Plan quota buckets (plan kind): percent used 0-100 and the reset time. */
   quota?: Array<{ label: string; percent: number; resetsAt: string; used?: number; limit?: number }>
-  /** Usage buckets (usage kind): tokens consumed over recent windows (e.g. 5h / 7d / 30d). */
-  usage?: Array<{ label: string; inputTokens: number; outputTokens: number }>
+  /**
+   * Usage buckets (usage kind): tokens consumed over recent windows (e.g. 5h /
+   * 7d / 30d). `approximate` marks a window whose boundary bucket the upstream
+   * returned whole — the bucket cannot be split by timestamp, so the total may
+   * include a little usage from just before the window.
+   */
+  usage?: Array<{ label: string; inputTokens: number; outputTokens: number; approximate?: boolean }>
   /** Manual note (manual kind). */
   note?: string
   /** When the account data was fetched (balance/plan/usage kinds). */
@@ -215,11 +241,14 @@ function isPrivateAddress(address: string): boolean {
 /**
  * Whether a stats request may be served.
  *
- * Loopback is always trusted. A private-range peer is trusted only when the
- * `Host` authority it addressed is one of `lanHosts` — the operator-declared
- * set of LAN authorities this panel answers on — which keeps an undeclared
- * host (a DNS-rebinding target, or a second interface the operator did not
- * mean to publish) rejected even though the peer's address looks local.
+ * Loopback is trusted when it addresses one of the loopback names, or an
+ * authority declared in `lanHosts` (e.g. the panel opened through a hosts-file
+ * name that resolves to 127.0.0.1). A private-range peer is trusted only when
+ * the `Host` authority it addressed is one of `lanHosts` — the operator-
+ * declared set of LAN authorities this panel answers on — which keeps an
+ * undeclared host (a DNS-rebinding target, or a second interface the operator
+ * did not mean to publish) rejected even though the peer's address looks
+ * local.
  *
  * On top of the peer/authority pair the browser's own same-origin markers are
  * enforced for every caller: an explicit `sec-fetch-site: cross-site`, or an
@@ -244,13 +273,14 @@ export function isStatsRequestAllowed(request: IncomingMessage, lanHosts: readon
   }
 
   const hostname = normalizeHostname(hostUrl.hostname)
+  const lanAuthority = lanHosts.some(entry => normalizeHostname(entry) === hostname)
   const loopback = isLoopbackAddress(address)
   if (loopback) {
-    if (!LOOPBACK_HOSTNAMES.has(hostname)) return false
+    if (!LOOPBACK_HOSTNAMES.has(hostname) && !lanAuthority) return false
   } else {
     // A LAN peer must both be private and have addressed a declared authority.
     if (!isPrivateAddress(address)) return false
-    if (!lanHosts.some(entry => normalizeHostname(entry) === hostname)) return false
+    if (!lanAuthority) return false
   }
 
   if (request.headers['sec-fetch-site'] === 'cross-site') return false
@@ -265,15 +295,22 @@ export function isStatsRequestAllowed(request: IncomingMessage, lanHosts: readon
 
 /** One JSON response. */
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
-  res.end(payload)
+  // 客户端断开后 ServerResponse 已 end/destroyed，再写会把一次正常取消升级成
+  // write-after-end 错误（与 session-delete 的同型守卫一致）。
+  if (res.writableEnded || res.destroyed) return
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+  })
+  res.end(JSON.stringify(body))
 }
 
 /* -------------------------------------------------- channel account probes */
 
 /** One configured model provider: how to find its key and endpoint. */
-interface ProviderConfig {
+export interface ProviderConfig {
   /** Provider id as recorded in UsageRecord.provider (or a stable label). */
   provider: string
   displayName: string
@@ -283,12 +320,27 @@ interface ProviderConfig {
   baseURL?: string
 }
 
-const SETTINGS_PATH = join(homedir(), '.dsh', 'settings.yaml')
+const SETTINGS_PATH = join(DSH_HOME, 'settings.yaml')
 
 /**
- * Read provider configurations from ~/.dsh/settings.yaml (llm-pi-ai.providers
- * and llm-deepseek). Falls back to the well-known local channels when the
- * file is unreadable. YAML parsed conservatively — no external dependency.
+ * The official DeepSeek route. Added to the probe list by the balances route
+ * only when DEEPSEEK_API_KEY actually resolves — the unconditional row kept a
+ * permanent「未找到凭据」 error card on installs without the credential.
+ */
+const DEEPSEEK_OFFICIAL_CONFIG: ProviderConfig = {
+  provider: 'deepseek-official',
+  displayName: 'DeepSeek 官方',
+  apiKeyEnv: 'DEEPSEEK_API_KEY',
+  baseURL: 'https://api.deepseek.com',
+}
+
+/**
+ * Read provider configurations from ~/.dsh/settings.yaml (`llm-pi-ai.providers`).
+ * The `llm-deepseek` section carries a model catalog and retry policy only — it
+ * has no apiKeyEnv-style provider entries, so it contributes nothing here (an
+ * older comment claimed otherwise). Falls back to the well-known local channels
+ * when the file is unreadable. YAML parsed conservatively — no external
+ * dependency.
  */
 function readProviderConfigs(): ProviderConfig[] {
   const configs: ProviderConfig[] = []
@@ -315,8 +367,6 @@ function readProviderConfigs(): ProviderConfig[] {
       { provider: 'mimo', displayName: '小米 MiMo Token Plan', apiKeyEnv: 'XIAOMI_API_KEY', baseURL: 'https://token-plan-cn.xiaomimimo.com/v1' },
     )
   }
-  // The official DeepSeek route always participates when configured.
-  configs.push({ provider: 'deepseek-official', displayName: 'DeepSeek 官方', apiKeyEnv: 'DEEPSEEK_API_KEY', baseURL: 'https://api.deepseek.com' })
   return configs
 }
 
@@ -392,17 +442,72 @@ function readBucketOffsetMinutes(): number {
   return Number.isFinite(numeric) && Math.abs(numeric) <= 900 ? numeric : local
 }
 
-/** Minimal YAML subset parser for settings.yaml provider maps (indent-aware, nested). */
-function parseSimpleYaml(text: string): Record<string, unknown> {
+/** Strip one layer of matching single/double quotes from a trimmed scalar. */
+function stripQuotes(value: string): string {
+  return value.length >= 2
+    && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+    ? value.slice(1, -1)
+    : value
+}
+
+/**
+ * Minimal YAML subset parser for settings.yaml maps (indent-aware, nested).
+ * Exported for tests.
+ *
+ * Supported: `key: value` scalars (one layer of quotes stripped — an audit
+ * round found `apiKeyEnv: "X"` reaching credentials.resolve with the quotes
+ * intact), bare `key:` nested maps, and scalar block lists (`key:` followed by
+ * `- item` lines — a block-list `lanHosts` used to vanish into an empty map
+ * with no trace, silently degrading the panel to loopback-only). Inline
+ * `[a, b]` lists intentionally stay strings; their readers split them. Any
+ * other shape (map-style list items, anchors, block scalars, multi-line
+ * continuations) is skipped with one warning per parse instead of silently.
+ */
+export function parseSimpleYaml(text: string): Record<string, unknown> {
   const root: Record<string, unknown> = {}
-  // Stack of open containers: ((indent, map)); nested maps are pushed on `key:` lines.
-  const stack: Array<{ indent: number; map: Record<string, unknown> }> = [{ indent: -1, map: root }]
+  // Stack of open containers. A bare `key:` pushes a placeholder map; if the
+  // block under it turns out to be `- item` lines, the placeholder reference
+  // in the parent is replaced by the array collected on that frame.
+  const stack: Array<{
+    indent: number
+    map: Record<string, unknown>
+    /** Parent map and own key — how the placeholder becomes a list. */
+    parent: Record<string, unknown> | null
+    key: string | null
+    list?: unknown[]
+  }> = [{ indent: -1, map: root, parent: null, key: null }]
+  let warned = false
+  const warnOnce = (line: string): void => {
+    if (warned) return
+    warned = true
+    console.warn(`[stats-panel] parseSimpleYaml 跳过了不支持的 YAML 形态（首处在 "${line.slice(0, 60)}" 附近），该写法声明的键保持未读`)
+  }
   for (const line of text.split('\n')) {
     const trimmed = line.trim()
-    if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('-')) continue
+    if (trimmed === '' || trimmed.startsWith('#')) continue
     const indent = line.length - line.trimStart().length
+    if (trimmed.startsWith('-')) {
+      // Pop containers at or deeper than the item's own indent; the nearest
+      // bare `key:` frame receives the item.
+      while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop()
+      const frame = stack[stack.length - 1]
+      const item = stripQuotes(trimmed.replace(/^-\s+/, ''))
+      // Scalar items only: map-style items (`- id: x`), empty dashes and
+      // root-level lists are out of scope for this parser's consumers.
+      if (item === '' || frame.parent === null || frame.key === null || item.includes(': ')) {
+        warnOnce(trimmed)
+        continue
+      }
+      frame.list ??= []
+      frame.parent[frame.key] = frame.list
+      frame.list.push(item)
+      continue
+    }
     const match = /^([A-Za-z0-9_.-]+):\s*(.*)$/.exec(trimmed)
-    if (match === null) continue
+    if (match === null) {
+      warnOnce(trimmed)
+      continue
+    }
     const key = match[1]
     const value = match[2].trim()
     // Pop containers that are deeper than this line.
@@ -411,9 +516,9 @@ function parseSimpleYaml(text: string): Record<string, unknown> {
     if (value === '') {
       const child: Record<string, unknown> = {}
       parent[key] = child
-      stack.push({ indent, map: child })
+      stack.push({ indent, map: child, parent, key })
     } else {
-      parent[key] = value
+      parent[key] = stripQuotes(value)
     }
   }
   return root
@@ -434,11 +539,16 @@ function readMimoCookie(): string | undefined {
   return undefined
 }
 
-/** Fetch with a bounded timeout; throws on non-OK or network failure. */
+/** Cap on one probe response body — a runaway upstream must not balloon memory. */
+const PROBE_BODY_MAX_BYTES = 2 * 1024 * 1024
+
+/** Fetch with a bounded timeout; throws on non-OK, oversized or non-JSON responses. */
 async function probeJson(url: string, headers: Record<string, string>, timeoutMs = 10_000): Promise<Record<string, unknown>> {
   const response = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  const body = await response.json() as unknown
+  const raw = await response.text()
+  if (Buffer.byteLength(raw) > PROBE_BODY_MAX_BYTES) throw new Error(`response body exceeds ${PROBE_BODY_MAX_BYTES} bytes`)
+  const body = JSON.parse(raw) as unknown
   if (typeof body !== 'object' || body === null) throw new Error('invalid JSON response')
   return body as Record<string, unknown>
 }
@@ -708,16 +818,23 @@ async function probeSub2ApiUsage(
 }
 
 /**
+ * Provider keys that mean "OpenCode Go 套餐".  The local bridge route carries a
+ * distinct key (its baseURL points at 127.0.0.1, so the zen/go URL test cannot
+ * match), but its quota still comes from the same upstream usage endpoint.
+ */
+const OPENCODE_GO_PROVIDERS = new Set(['opencode-go', 'opencode-go-bridge'])
+
+/**
  * One channel's account probe. Returns the ChannelBalance or throws.
  * Adapts the well-known provider endpoints (community-verified by cc-switch
- * plus OpenCode Go / OpenAI / Anthropic usage APIs).
+ * plus OpenCode Go / OpenAI / Anthropic usage APIs). Exported for tests.
  */
-async function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (name: string) => Promise<string | undefined>): Promise<ChannelBalance> {
+export async function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (name: string) => Promise<string | undefined>): Promise<ChannelBalance> {
   const base = config.baseURL ?? ''
   const url = base.toLowerCase()
   const now = Date.now()
 
-  if (url.includes('opencode.ai/zen/go') || config.provider === 'opencode-go') {
+  if (url.includes('opencode.ai/zen/go') || OPENCODE_GO_PROVIDERS.has(config.provider)) {
     // Plan quota: rolling / weekly / monthly (percent used + reset time).
     const key = await resolveKey(config.apiKeyEnv)
     if (key === undefined) return { channel: config.provider, kind: 'plan', displayName: config.displayName, error: `未找到 ${config.apiKeyEnv} 凭据` }
@@ -781,9 +898,12 @@ async function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (n
       return name === 'plan_total_token' || (limit !== undefined && limit > 0)
     })
     if (primary !== undefined && typeof primary === 'object' && primary !== null) {
+      const rawPercent = numField(primary, 'percent') ?? 0
       quota.push({
         label: labelOf(typeof primary['name'] === 'string' ? String(primary['name']) : '总套餐'),
-        percent: (numField(primary, 'percent') ?? 0) * 100,
+        // 上游实践口径为 0-1；已大于 1 的值视为已是 0-100，不再乘 100（防御
+        // 量纲漂移把 40 渲染成 4000%）。
+        percent: rawPercent > 1 ? rawPercent : rawPercent * 100,
         resetsAt: '',
         used: numField(primary, 'used'),
         limit: numField(primary, 'limit'),
@@ -894,29 +1014,45 @@ async function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (n
 
   if (url.includes('api.openai.com')) {
     // OpenAI usage API: tokens over the last 5h / 7d / 30d (org-level key required).
+    // 5h/7d must use 1h buckets: with 1d buckets a "5 hours" window summed
+    // whole UTC-day buckets (the in-progress day bucket is usually not
+    // returned yet), so the row read as 0 or as a full day. The bucket the
+    // window start falls into cannot be split by timestamp — rows entirely
+    // outside the window are skipped, a partially covered boundary bucket is
+    // kept whole and the row is flagged `approximate` for the UI.
     const key = await resolveKey(config.apiKeyEnv)
     if (key === undefined) return { channel: config.provider, kind: 'plan', displayName: config.displayName, error: `未找到 ${config.apiKeyEnv} 凭据` }
     const day = 86_400_000
-    const buckets: Array<{ label: string; windowMs: number }> = [
-      { label: '5小时', windowMs: 5 * 3_600_000 },
-      { label: '7天', windowMs: 7 * day },
-      { label: '30天', windowMs: 30 * day },
+    const buckets: Array<{ label: string; windowMs: number; widthMs: number }> = [
+      { label: '5小时', windowMs: 5 * 3_600_000, widthMs: 3_600_000 },
+      { label: '7天', windowMs: 7 * day, widthMs: 3_600_000 },
+      { label: '30天', windowMs: 30 * day, widthMs: day },
     ]
     // Buckets are independent — query them concurrently to bound wall time.
     const usage = await Promise.all(buckets.map(async (bucket) => {
-      const start = Math.floor((now - bucket.windowMs) / 1000)
+      const windowStartMs = now - bucket.windowMs
       const body = await probeJson(
-        `https://api.openai.com/v1/usage?start_time=${start}&bucket_width=1d`,
+        `https://api.openai.com/v1/usage?start_time=${Math.floor(windowStartMs / 1000)}&bucket_width=${bucket.widthMs === day ? '1d' : '1h'}`,
         { authorization: `Bearer ${key}` },
       )
       const rows = body['data'] as Array<Record<string, unknown>> | undefined ?? []
       let input = 0
       let output = 0
+      let approximate = false
       for (const row of rows) {
+        const rowStartMs = typeof row['start_time'] === 'string' ? Date.parse(row['start_time']) : Number.NaN
+        if (Number.isFinite(rowStartMs)) {
+          if (rowStartMs + bucket.widthMs <= windowStartMs) continue
+          if (rowStartMs < windowStartMs) approximate = true
+        } else {
+          // Without the bucket's own timestamp the boundary cannot be
+          // verified — treat the window as approximate.
+          approximate = true
+        }
         input += numField(row, 'input_tokens') ?? 0
         output += numField(row, 'output_tokens') ?? 0
       }
-      return { label: bucket.label, inputTokens: input, outputTokens: output }
+      return { label: bucket.label, inputTokens: input, outputTokens: output, ...(approximate ? { approximate: true } : {}) }
     }))
     return { channel: config.provider, kind: 'plan', displayName: config.displayName, usage, fetchedAt: now }
   }
@@ -1247,13 +1383,52 @@ function loadRecords(cutoffTs?: number): UsageRecord[] {
   }
 }
 
-/** Persist one record (best effort; a failed write must never take the GUI down). */
+/**
+ * Persist one record (best effort; a failed write must never take the GUI
+ * down). Lines go through fs.promises.appendFile — appendFileSync ran on the
+ * event hot path for every assistant message. A single-flight pump preserves
+ * the caller's order (live events from different sessions interleave) and the
+ * first failure warns once instead of silently dropping rows.
+ */
+let appendQueue: string[] = []
+let appendInFlight = false
+let appendTail: Promise<void> = Promise.resolve()
+let appendWarned = false
+
+function pumpAppendQueue(): void {
+  if (appendInFlight) return
+  appendInFlight = true
+  appendTail = (async () => {
+    while (appendQueue.length > 0) {
+      const lines = appendQueue.join('')
+      appendQueue = []
+      try {
+        await appendFile(RECORDS_FILE, lines, 'utf8')
+        appendWarned = false
+      } catch (e) {
+        if (!appendWarned) {
+          appendWarned = true
+          console.warn(`[stats-panel] 追加 ${RECORDS_FILE} 失败（本批明细仅保留在内存摘要中）: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+    }
+  })().finally(() => {
+    appendInFlight = false
+  })
+  // Trailing lines queued while the last batch was awaited start a new pump.
+  void appendTail.then(() => {
+    if (appendQueue.length > 0) pumpAppendQueue()
+  })
+}
+
 function appendRecord(record: UsageRecord): void {
-  try {
-    appendFileSync(RECORDS_FILE, JSON.stringify(record) + '\n')
-  } catch {
-    // Ignore persistence failures.
-  }
+  appendQueue.push(JSON.stringify(record) + '\n')
+  pumpAppendQueue()
+}
+
+/** Resolves once every line queued so far has reached the disk (or failed). Exported for tests. */
+export function flushAppendQueue(): Promise<void> {
+  return appendTail.then(() => (appendQueue.length > 0 ? flushAppendQueue() : undefined))
 }
 
 /** Write via a process-unique tmp+rename so crashes cannot truncate the target. */
@@ -1262,6 +1437,68 @@ function writeFileAtomic(path: string, data: string): void {
   const tmp = `${path}.${process.pid}.${++atomicWriteId}.tmp`
   writeFileSync(tmp, data)
   renameSync(tmp, path)
+}
+
+/** {mtimeMs, size} of one file, or null when absent — a cheap writer fingerprint. */
+interface FileStamp {
+  mtimeMs: number
+  size: number
+}
+
+function stampOf(path: string): FileStamp | null {
+  try {
+    const stats = statSync(path)
+    return { mtimeMs: stats.mtimeMs, size: stats.size }
+  } catch {
+    return null
+  }
+}
+
+function sameStamp(a: FileStamp | null, b: FileStamp | null): boolean {
+  return a?.mtimeMs === b?.mtimeMs && a?.size === b?.size
+}
+
+/**
+ * Acquire the compaction lock with an exclusive create. When the file already
+ * exists, a lock younger than the staleness window means another live process
+ * is compacting right now; an older one was abandoned by a crashed holder and
+ * is unlinked so the create can be retried once.
+ */
+function acquireCompactionLock(): boolean {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(COMPACT_LOCK_FILE, 'wx')
+      try {
+        writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }))
+      } finally {
+        closeSync(fd)
+      }
+      return true
+    } catch {
+      let stale: boolean
+      try {
+        stale = Date.now() - statSync(COMPACT_LOCK_FILE).mtimeMs >= COMPACT_LOCK_STALE_MS
+      } catch {
+        return false // vanished between create and stat — leave retry to the next call
+      }
+      if (!stale) return false
+      try {
+        unlinkSync(COMPACT_LOCK_FILE)
+      } catch {
+        return false // someone else took it over first
+      }
+    }
+  }
+  return false
+}
+
+/** Release the compaction lock; harmless when it is already gone. */
+function releaseCompactionLock(): void {
+  try {
+    unlinkSync(COMPACT_LOCK_FILE)
+  } catch {
+    // Already released or taken over by another process.
+  }
 }
 
 /** Archived aggregates for the detail prefix below `cutoffTs`. */
@@ -1709,6 +1946,12 @@ export function apply(ctx: Context): void {
   const bootArchive = loadArchive()
   let archive: ArchiveFile | null = bootArchive
   let records = loadRecords(bootArchive?.cutoffTs)
+  /**
+   * archive.json as this process loaded (or last wrote) it. A stat mismatch
+   * inside the compaction lock means another host process folded rows this
+   * view still holds in memory.
+   */
+  let archiveStamp = stampOf(ARCHIVE_FILE)
   /** Calendar for day/week/month buckets; read once, like lanHosts. */
   const bucketOffsetMinutes = readBucketOffsetMinutes()
   /** Compaction trigger, overridable for tests and constrained hosts. */
@@ -1727,6 +1970,15 @@ export function apply(ctx: Context): void {
   // Live event feeds from different sessions may interleave. Keep the route
   // association per session instead of sharing the last observed header.
   const liveRoutes = new Map<string, { model: string; provider: string }>()
+  // Seed the map from the durable log: `request/header` fires once per turn, so
+  // a plugin re-apply (hot reload) in the middle of a long turn would otherwise
+  // lose the attribution for that session's remaining calls and record them as
+  // `unknown`. The last known route per session survives the reload this way,
+  // and the next header simply overwrites it.
+  for (const record of records) {
+    if (record.model === 'unknown' && record.provider === 'unknown') continue
+    liveRoutes.set(record.sessionId, { model: record.model, provider: record.provider })
+  }
 
   const collect = (
     sessionId: unknown,
@@ -1793,6 +2045,35 @@ export function apply(ctx: Context): void {
   }
 
   /**
+   * Adopt an archive.json written by another host process since this view was
+   * loaded: the newer cutoff prunes the already-folded rows from memory and
+   * `seen` is rebuilt. Returns true when the view moved, so the caller defers
+   * its own compaction to the next round instead of double-counting rows that
+   * the other process already folded.
+   */
+  const adoptAdvancedArchive = (): boolean => {
+    const onDisk = stampOf(ARCHIVE_FILE)
+    if (sameStamp(onDisk, archiveStamp)) return false
+    const fresh = loadArchive()
+    if (fresh === null) {
+      // The newer file is unreadable — never fold on top of an unknown state.
+      // (A file that vanished is adopted as absence; the next compaction
+      // recreates the archive from this self-consistent view.)
+      ctx.logger?.warn('[stats-panel] archive.json 在本进程之外被改写且无法读取，跳过本轮压缩')
+      if (onDisk === null) archiveStamp = null
+      return true
+    }
+    archive = fresh
+    records = records.filter(record => record.ts >= fresh.cutoffTs)
+    seen.clear()
+    for (const record of records) seen.add(`${record.sessionId}:${record.seq}`)
+    summaryCache.dirty = true
+    archiveStamp = onDisk
+    ctx.logger?.warn(`[stats-panel] 已并入其他进程压缩的归档（cutoff ${new Date(fresh.cutoffTs).toISOString()}），折叠明细已从内存视图剔除`)
+    return true
+  }
+
+  /**
    * Fold the eligible detail prefix into the archive once the detail log grows
    * past the retention ceiling. Called at boot AND opportunistically from the
    * summary route, so a host that stays up for weeks still compacts instead of
@@ -1800,41 +2081,62 @@ export function apply(ctx: Context): void {
    *
    * Order is crash-safe — loadRecords and collect() both ignore detail below
    * `cutoffTs`, so a records rewrite that never lands cannot double-count.
+   *
+   * Cross-process safety (round-1 audit: a second host process holding an
+   * older view re-folded rows another process had already folded, and the
+   * last-writer archive doubled the totals): an O_EXCL lock file serializes
+   * concurrent compactions (a lock older than COMPACT_LOCK_STALE_MS was left
+   * by a crashed holder and is taken over); inside the lock the archive file
+   * stamp is re-checked, and a mismatch adopts the newer archive — pruning the
+   * folded rows from this view — before the compaction is deferred.
    * @param persistState - boot-path hook that rewrites the full skip-cache.
    */
-  const maybeCompact = (persistState?: () => void): void => {
+  const maybeCompact = async (persistState?: () => void): Promise<void> => {
     if (records.length < maxRecords) return
-    const plan = compactRecords(records, Date.now(), bucketOffsetMinutes)
-    if (plan === null) return
-    const aggregate = archive === null ? plan.aggregate : mergeAggregates(archive.aggregate, plan.aggregate)
-    const nextArchive: ArchiveFile = {
-      version: 1,
-      cutoffTs: plan.cutoffTs,
-      aggregate,
-      // A merge inherits the OLDER calendar: rows already folded under it cannot
-      // be re-split, so the archive keeps advertising that boundary and the
-      // summary keeps telling the operator about it.
-      bucketOffsetMinutes: archive === null ? bucketOffsetMinutes : (archive.bucketOffsetMinutes ?? 0),
-    }
-    const retainedData = plan.retained.length === 0
-      ? ''
-      : `${plan.retained.map(record => JSON.stringify(record)).join('\n')}\n`
+    if (!acquireCompactionLock()) return
     try {
-      writeFileAtomic(ARCHIVE_FILE, JSON.stringify(nextArchive))
-      // Once the archive is committed, it is the durable guard against replaying
-      // the old detail prefix. Reflect that guard in memory before the second write.
-      archive = nextArchive
-      records.length = 0
-      records.push(...plan.retained)
-      seen.clear()
-      for (const record of records) seen.add(`${record.sessionId}:${record.seq}`)
-      summaryCache.dirty = true
-      writeFileAtomic(RECORDS_FILE, retainedData)
-      if (persistState !== undefined) persistState()
-      else refreshBackfillRecordCount()
-    } catch {
-      // If the detail rewrite fails, the committed archive filters the old rows
-      // on next boot; the in-memory view already matches it.
+      // Drain pending async appends first so the records rewrite below cannot
+      // be followed by straggler lines for rows this compaction just folded.
+      await flushAppendQueue()
+      if (adoptAdvancedArchive()) return
+      const plan = compactRecords(records, Date.now(), bucketOffsetMinutes)
+      if (plan === null) return
+      const aggregate = archive === null ? plan.aggregate : mergeAggregates(archive.aggregate, plan.aggregate)
+      const nextArchive: ArchiveFile = {
+        version: 1,
+        cutoffTs: plan.cutoffTs,
+        aggregate,
+        // A merge inherits the OLDER calendar: rows already folded under it cannot
+        // be re-split, so the archive keeps advertising that boundary and the
+        // summary keeps telling the operator about it.
+        bucketOffsetMinutes: archive === null ? bucketOffsetMinutes : (archive.bucketOffsetMinutes ?? 0),
+      }
+      const retainedData = plan.retained.length === 0
+        ? ''
+        : `${plan.retained.map(record => JSON.stringify(record)).join('\n')}\n`
+      try {
+        writeFileAtomic(ARCHIVE_FILE, JSON.stringify(nextArchive))
+        // Once the archive is committed, it is the durable guard against replaying
+        // the old detail prefix. Reflect that guard in memory before the second write.
+        archive = nextArchive
+        records.length = 0
+        // Spread-pushing plan.retained threw RangeError past ~100k rows and the
+        // old catch swallowed it with the records array already emptied.
+        for (const record of plan.retained) records.push(record)
+        seen.clear()
+        for (const record of records) seen.add(`${record.sessionId}:${record.seq}`)
+        summaryCache.dirty = true
+        writeFileAtomic(RECORDS_FILE, retainedData)
+        archiveStamp = stampOf(ARCHIVE_FILE)
+        if (persistState !== undefined) persistState()
+        else refreshBackfillRecordCount()
+      } catch (e) {
+        // If the detail rewrite fails, the committed archive filters the old rows
+        // on next boot; the in-memory view already matches it.
+        ctx.logger?.warn(`[stats-panel] 压缩写盘失败（归档已提交，明细保留在内存视图）: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    } finally {
+      releaseCompactionLock()
     }
   }
 
@@ -1923,7 +2225,7 @@ export function apply(ctx: Context): void {
       if (stateDirty) persistBackfillState()
       // Retention compaction folds the eligible detail prefix into the archive
       // and retains future/boundary rows.
-      maybeCompact(persistBackfillState)
+      await maybeCompact(persistBackfillState)
     } catch {
       // No sessionQuery service (or a query failure): live-only collection.
     }
@@ -1948,7 +2250,7 @@ export function apply(ctx: Context): void {
       }
       // Keep the detail log bounded on hosts that never restart. Compaction only
       // does work past the ceiling, so this stays a length check on the hot path.
-      maybeCompact()
+      await maybeCompact()
       // Re-fold after new records landed, or when the bucket day rolled over so a
       // dashboard left open across midnight stops reporting yesterday as today.
       if (summaryCache.dirty || summaryCache.value === undefined
@@ -1962,7 +2264,11 @@ export function apply(ctx: Context): void {
       writeJson(res, 200, summaryCache.value)
     },
   }
-  ctx.webServer.register(route)
+  // Registered through ctx.effect: the webserver rejects a duplicate
+  // (kind, path) pair, so the disposer must run on fiber dispose — otherwise a
+  // hot reload or re-apply leaves the old route behind and the fresh fiber dies
+  // with "duplicate exact route", silently stopping usage collection.
+  ctx.effect(() => ctx.webServer.register(route))
 
   // Channel account statuses: balance channels (DeepSeek / Kimi / SiliconFlow
   // / StepFun / OpenRouter / Novita), plan-quota channels (OpenCode Go) and
@@ -2010,6 +2316,13 @@ export function apply(ctx: Context): void {
           seen.add(config.provider)
           configs.push(config)
         }
+        // The official DeepSeek route joins the probe list only when its
+        // credential actually resolves — without DEEPSEEK_API_KEY the old
+        // unconditional row kept a permanent「未找到凭据」 error card.
+        if (!seen.has(DEEPSEEK_OFFICIAL_CONFIG.provider)
+          && await resolveKey(DEEPSEEK_OFFICIAL_CONFIG.apiKeyEnv) !== undefined) {
+          configs.push(DEEPSEEK_OFFICIAL_CONFIG)
+        }
         // Every probe races a deadline: a single stalled upstream must not hold
         // the whole round. The loser keeps running with its own fetch timeout and
         // its result is discarded; the row comes back as an explicit timeout so
@@ -2024,7 +2337,7 @@ export function apply(ctx: Context): void {
             timer = setTimeout(() => {
               resolve({
                 channel: config.provider,
-                kind: 'plan' as const,
+                kind: 'error' as const,
                 displayName: config.displayName,
                 error: `查询超时（超过 ${Math.round(deadlineMs / 1000)} 秒）`,
               })
@@ -2035,7 +2348,7 @@ export function apply(ctx: Context): void {
           } catch (e) {
             return {
               channel: config.provider,
-              kind: 'plan' as const,
+              kind: 'error' as const,
               displayName: config.displayName,
               error: `查询失败：${e instanceof Error ? e.message : String(e)}`,
             }
@@ -2052,5 +2365,5 @@ export function apply(ctx: Context): void {
       writeJson(res, 200, { balances: await balancesInFlight })
     },
   }
-  ctx.webServer.register(balancesRoute)
+  ctx.effect(() => ctx.webServer.register(balancesRoute))
 }

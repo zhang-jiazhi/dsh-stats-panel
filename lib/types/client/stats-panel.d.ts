@@ -31,4 +31,9 @@ export declare function isCurrentRequest(requestId: number, currentId: number, a
  * cost KPI and the cost columns always agree.
  */
 export declare function StatsView(): React.ReactElement;
+/**
+ * Format a millisecond span as "X天 X小时 X分钟" (omitting empty units).
+ * Exported for tests.
+ */
+export declare function formatDuration(ms: number): string;
 //# sourceMappingURL=stats-panel.d.ts.map

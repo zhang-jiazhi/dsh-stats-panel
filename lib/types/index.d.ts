@@ -90,8 +90,13 @@ export interface ChannelStats {
 /** One channel's account status (balance or plan quota), fetched by the balances route. */
 export interface ChannelBalance {
     channel: string;
-    /** 'balance' = pay-as-you-go balance; 'plan' = subscription quota; 'manual' = user-entered. */
-    kind: 'balance' | 'plan' | 'manual';
+    /**
+     * 'balance' = pay-as-you-go balance; 'plan' = subscription quota;
+     * 'manual' = user-entered; 'error' = the probe itself failed (deadline or
+     * exception) — the round-1 audit found these hardcoded as 'plan', which
+     * rendered a「套餐」badge on a failed query.
+     */
+    kind: 'balance' | 'plan' | 'manual' | 'error';
     displayName: string;
     /** Balance amount (balance kind). */
     balance?: string;
@@ -104,11 +109,17 @@ export interface ChannelBalance {
         used?: number;
         limit?: number;
     }>;
-    /** Usage buckets (usage kind): tokens consumed over recent windows (e.g. 5h / 7d / 30d). */
+    /**
+     * Usage buckets (usage kind): tokens consumed over recent windows (e.g. 5h /
+     * 7d / 30d). `approximate` marks a window whose boundary bucket the upstream
+     * returned whole — the bucket cannot be split by timestamp, so the total may
+     * include a little usage from just before the window.
+     */
     usage?: Array<{
         label: string;
         inputTokens: number;
         outputTokens: number;
+        approximate?: boolean;
     }>;
     /** Manual note (manual kind). */
     note?: string;
@@ -137,11 +148,14 @@ export interface DailyStats {
 /**
  * Whether a stats request may be served.
  *
- * Loopback is always trusted. A private-range peer is trusted only when the
- * `Host` authority it addressed is one of `lanHosts` — the operator-declared
- * set of LAN authorities this panel answers on — which keeps an undeclared
- * host (a DNS-rebinding target, or a second interface the operator did not
- * mean to publish) rejected even though the peer's address looks local.
+ * Loopback is trusted when it addresses one of the loopback names, or an
+ * authority declared in `lanHosts` (e.g. the panel opened through a hosts-file
+ * name that resolves to 127.0.0.1). A private-range peer is trusted only when
+ * the `Host` authority it addressed is one of `lanHosts` — the operator-
+ * declared set of LAN authorities this panel answers on — which keeps an
+ * undeclared host (a DNS-rebinding target, or a second interface the operator
+ * did not mean to publish) rejected even though the peer's address looks
+ * local.
  *
  * On top of the peer/authority pair the browser's own same-origin markers are
  * enforced for every caller: an explicit `sec-fetch-site: cross-site`, or an
@@ -154,6 +168,38 @@ export interface DailyStats {
  * @returns whether the request is allowed to read stats.
  */
 export declare function isStatsRequestAllowed(request: IncomingMessage, lanHosts?: readonly string[]): boolean;
+/** One configured model provider: how to find its key and endpoint. */
+export interface ProviderConfig {
+    /** Provider id as recorded in UsageRecord.provider (or a stable label). */
+    provider: string;
+    displayName: string;
+    /** Credential reference name (apiKeyEnv), resolved through ctx.credentials. */
+    apiKeyEnv: string;
+    /** Endpoint base URL (may be undefined → catalog default). */
+    baseURL?: string;
+}
+/**
+ * Minimal YAML subset parser for settings.yaml maps (indent-aware, nested).
+ * Exported for tests.
+ *
+ * Supported: `key: value` scalars (one layer of quotes stripped — an audit
+ * round found `apiKeyEnv: "X"` reaching credentials.resolve with the quotes
+ * intact), bare `key:` nested maps, and scalar block lists (`key:` followed by
+ * `- item` lines — a block-list `lanHosts` used to vanish into an empty map
+ * with no trace, silently degrading the panel to loopback-only). Inline
+ * `[a, b]` lists intentionally stay strings; their readers split them. Any
+ * other shape (map-style list items, anchors, block scalars, multi-line
+ * continuations) is skipped with one warning per parse instead of silently.
+ */
+export declare function parseSimpleYaml(text: string): Record<string, unknown>;
+/**
+ * One channel's account probe. Returns the ChannelBalance or throws.
+ * Adapts the well-known provider endpoints (community-verified by cc-switch
+ * plus OpenCode Go / OpenAI / Anthropic usage APIs). Exported for tests.
+ */
+export declare function probeChannel(ctx: Context, config: ProviderConfig, resolveKey: (name: string) => Promise<string | undefined>): Promise<ChannelBalance>;
+/** Resolves once every line queued so far has reached the disk (or failed). Exported for tests. */
+export declare function flushAppendQueue(): Promise<void>;
 /** Running fold state — the mutable accumulators behind the summary. */
 interface FoldState {
     totals: {

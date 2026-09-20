@@ -5,3 +5,6 @@ dist/
 *.local
 .env
 *.env
+
+# 会话工作记录（非发布内容）
+codex-session-records/

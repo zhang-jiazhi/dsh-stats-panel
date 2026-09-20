@@ -1,7 +1,9 @@
 # 渠道适配器说明
 
 插件按渠道（provider）聚合用量，并自动查询各渠道的余额或套餐余量。
-渠道由 `~/.dsh/settings.yaml` 中的模型配置自动发现（`llm-pi-ai.providers` 与 `llm-deepseek`），
+渠道由 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers` 自动发现（`llm-deepseek` 段只有
+模型目录与重试策略，没有 `apiKeyEnv` 类字段，不参与发现）；`deepseek-official`
+仅当 `DEEPSEEK_API_KEY` 凭据可解析时自动加入探测列表。
 凭据按 `apiKeyEnv` 通过 DSH 的 credentials 服务解析（`~/.dsh/.credentials.yaml` 或环境变量）。
 
 ## 查询方式
@@ -15,7 +17,7 @@
 | `openrouter.ai` | 余额 | `GET /api/v1/credits` | OpenRouter 额度（USD） |
 | `api.novita.ai` | 余额 | `GET /v3/user/balance` | Novita 余额（USD，0.0001 精度） |
 | `opencode.ai/zen/go` | 套餐配额 | `GET /zen/go/v1/usage` | 滚动 / 7天 / 30天 配额百分比与重置时间 |
-| `api.openai.com` | 用量 | `GET /v1/usage` | 5小时 / 7天 / 30天 Token 用量（需组织级 Key） |
+| `api.openai.com` | 用量 | `GET /v1/usage` | 5小时 / 7天（1h 桶）/ 30天（1d 桶）Token 用量（需组织级 Key）；窗口边界所在桶由上游整桶返回，无法按时刻拆分，该行会带 `approximate` 标记（UI 显示「近似」） |
 | `api.anthropic.com` | 用量 | `GET /v1/organizations/usage/costs` | 同上（需管理员 Key） |
 | `token-plan-cn.xiaomimimo.com`（provider `mimo`） | 套餐用量 | `GET platform.xiaomimimo.com/api/v1/tokenPlan/usage` | 需平台登录 Cookie（`~/.dsh/stats-panel/mimo-cookie.txt` 或 `MIMO_PLATFORM_COOKIE`） |
 | **通用兜底 ①**：任意 baseURL | 余额 | `GET <base>/dashboard/billing/subscription` + `/usage` | NewAPI / one-api 系中转（AgentRouter 等）。`hard_limit_usd` = 剩余+已用，余额 = hard_limit − `total_usage`/100；直连被 Cloudflare 拦时可走本地浏览器桥 |

@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { StatsSummary, UsageRecord } from './index.ts'
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const { testHome } = vi.hoisted(() => ({
@@ -11,6 +11,12 @@ const { testHome } = vi.hoisted(() => ({
 }))
 
 vi.mock('node:os', () => ({ homedir: () => testHome }))
+
+// DATA_DIR 现在优先读 DSH_HOME（宿主 @deepseek-ai/dsh-home-paths 语义），
+// 而测试靠 mock homedir 隔离 —— 若运行环境恰好导出了真实 DSH_HOME，
+// 它会绕过被 mock 的 homedir、把测试写到真实数据目录。这里显式清掉，
+// 让 _HOME 解析回落到 mock 的 homedir。
+delete process.env.DSH_HOME
 
 const plugin = await import('./index.ts')
 
@@ -51,9 +57,11 @@ function usageEvent(seq: number, inputTokens: number, outputTokens: number, time
 function mount(query?: unknown, persistence?: unknown, credentials?: unknown): {
   listeners: Map<string, Listener>
   routes: Map<string, RegisteredRoute>
+  disposers: Array<() => void>
 } {
   const listeners = new Map<string, Listener>()
   const routes = new Map<string, RegisteredRoute>()
+  const disposers: Array<() => void> = []
   const context = {
     on(event: string, listener: Listener) {
       listeners.set(event, listener)
@@ -64,14 +72,25 @@ function mount(query?: unknown, persistence?: unknown, credentials?: unknown): {
       if (name === 'credentials') return credentials
       return undefined
     },
+    // cordis 契约：effect 立即执行回调，并登记其返回的清理函数，fiber dispose
+    // 时统一释放。路由必须走这条路径，否则重载后同路径重注册会抛
+    // "duplicate exact route"（见 src/index.ts 顶部说明）。
+    effect(callback: () => unknown) {
+      const disposer = callback()
+      if (typeof disposer === 'function') disposers.push(disposer as () => void)
+      return disposer
+    },
     webServer: {
       register(route: RegisteredRoute) {
         routes.set(route.path, route)
+        return () => {
+          routes.delete(route.path)
+        }
       },
     },
   } as unknown as Context
   plugin.apply(context)
-  return { listeners, routes }
+  return { listeners, routes, disposers }
 }
 
 function emit(harness: ReturnType<typeof mount>, sessionId: string, event: unknown): void {
@@ -115,7 +134,7 @@ async function readSummary(harness: ReturnType<typeof mount>): Promise<StatsSumm
   return JSON.parse(payload) as StatsSummary
 }
 
-async function readBalances(harness: ReturnType<typeof mount>): Promise<{ balances: Array<{ channel: string; error?: string }> }> {
+async function readBalances(harness: ReturnType<typeof mount>): Promise<{ balances: Array<{ channel: string; error?: string; balance?: string; kind?: string }> }> {
   const route = harness.routes.get('/api/stats-panel/balances')
   if (route === undefined) throw new Error('balances route was not registered')
   let payload = ''
@@ -150,7 +169,10 @@ function detailRecord(
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  // 持久化经 fs.promises 单飞队列异步落盘：先排空上一用例的在途追加，
+  // 再清空数据目录，避免上一用例的行落进本用例的文件。
+  await plugin.flushAppendQueue()
   clearData()
   delete process.env['DSH_STATS_COMPACT_MAX_RECORDS']
 })
@@ -192,6 +214,8 @@ describe('host data integrity', () => {
       data: { usage: { inputTokens: 'oops', outputTokens: 2 } },
     })
     emit(harness, 'session-live', usageEvent(1, 12, 3))
+    // 持久化改为 fs.promises.appendFile 单飞队列：等队列落盘再核对文件。
+    await settle()
 
     const summary = await readSummary(harness)
     expect(summary.totalCalls).toBe(1)
@@ -483,6 +507,107 @@ describe('host data integrity', () => {
       delete process.env['DSH_STATS_BALANCE_DEADLINE_MS']
     }
   })
+
+  it('adds the official DeepSeek row only when its credential resolves', async () => {
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = (async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ balance_infos: [{ total_balance: 42, currency: 'CNY' }] }),
+    })) as unknown as typeof fetch
+    try {
+      const withKey = mount(undefined, undefined, {
+        resolve: async (name: string) => (name === 'DEEPSEEK_API_KEY' ? { value: 'sk-test' } : undefined),
+      })
+      const rows = await readBalances(withKey)
+      expect(rows.balances.find(row => row.channel === 'deepseek-official')?.balance).toBe('42')
+
+      // 没有 DEEPSEEK_API_KEY 凭据时不得常驻「未找到凭据」错误行。
+      const withoutKey = mount(undefined, undefined, { resolve: async () => undefined })
+      const empty = await readBalances(withoutKey)
+      expect(empty.balances.find(row => row.channel === 'deepseek-official')).toBeUndefined()
+    } finally {
+      globalThis.fetch = previousFetch
+    }
+  })
+
+  it('serializes compaction through the lock file and takes over a stale one', async () => {
+    process.env['DSH_STATS_COMPACT_MAX_RECORDS'] = '2'
+    try {
+      const lockFile = join(dataDir, 'compact.lock')
+      const base = Date.now() - 60_000
+      writeFileSync(recordsFile, [
+        detailRecord('s', 1, 'm', 'p', 10, 5, base),
+        detailRecord('s', 2, 'm', 'p', 20, 6, base + 1),
+        detailRecord('s', 3, 'm', 'p', 30, 7, base + 2),
+      ].map(record => JSON.stringify(record)).join('\n') + '\n')
+      // 新鲜的外部锁 = 另一个进程正在压缩：本轮必须跳过，而不是并发写。
+      writeFileSync(lockFile, JSON.stringify({ pid: 1, at: Date.now() }))
+      const harness = mount({ listSessions: async () => [] })
+      await settle()
+      const blocked = await readSummary(harness)
+      expect(existsSync(archiveFile)).toBe(false)
+      expect(blocked.totalCalls).toBe(3)
+
+      // 超过陈旧窗口的锁属于崩溃残留：接管压缩并释放锁。
+      const stale = new Date(Date.now() - 120_000)
+      utimesSync(lockFile, stale, stale)
+      const compacted = await readSummary(harness)
+      expect(existsSync(archiveFile)).toBe(true)
+      expect(compacted.totalCalls).toBe(3)
+      expect(existsSync(lockFile)).toBe(false)
+    } finally {
+      delete process.env['DSH_STATS_COMPACT_MAX_RECORDS']
+    }
+  })
+
+  it('adopts an archive compacted by another process instead of folding its rows twice', async () => {
+    process.env['DSH_STATS_COMPACT_MAX_RECORDS'] = '2'
+    try {
+      const now = Date.now()
+      const bootArchive = {
+        version: 1,
+        cutoffTs: now - 5_000,
+        bucketOffsetMinutes: 0,
+        aggregate: plugin.aggregateOf([detailRecord('old', 1, 'm0', 'p0', 5, 1, now - 6_000)]),
+      }
+      writeFileSync(archiveFile, JSON.stringify(bootArchive))
+      writeFileSync(recordsFile, `${JSON.stringify(detailRecord('a', 1, 'm1', 'p1', 10, 1, now - 4_000))}\n`)
+
+      const harness = mount({ listSessions: async () => [] })
+      await settle()
+
+      // 本进程再收到一条明细（此时 records.length 达到压缩阈值），
+      // 随后另一进程把两条明细折叠进归档并重写 archive.json。
+      emit(harness, 'b', sessionHeaderEvent('m2', 'p2', 0, now - 3_000))
+      emit(harness, 'b', usageEvent(1, 20, 2, now - 3_000))
+      await settle()
+      const advanced = {
+        version: 1,
+        cutoffTs: now - 2_000,
+        bucketOffsetMinutes: 0,
+        aggregate: plugin.mergeAggregates(
+          bootArchive.aggregate,
+          plugin.aggregateOf([
+            detailRecord('a', 1, 'm1', 'p1', 10, 1, now - 4_000),
+            detailRecord('b', 1, 'm2', 'p2', 20, 2, now - 3_000),
+          ]),
+        ),
+      }
+      writeFileSync(archiveFile, JSON.stringify(advanced))
+
+      const summary = await readSummary(harness)
+      // 两条已折叠明细不得被本进程的压缩再折一次：总量 = 旧归档 1 + 采纳 2。
+      expect(summary.totalCalls).toBe(3)
+      expect(summary.totalInputTokens).toBe(35)
+      expect(summary.totalOutputTokens).toBe(4)
+      // 磁盘上的归档保持另一进程的版本，未被旧视图重写。
+      expect(JSON.parse(readFileSync(archiveFile, 'utf8')).aggregate.totals.calls).toBe(3)
+      expect((await readSummary(harness)).totalCalls).toBe(3)
+    } finally {
+      delete process.env['DSH_STATS_COMPACT_MAX_RECORDS']
+    }
+  })
 })
 
 describe('pure aggregate invariants', () => {
@@ -585,5 +710,28 @@ describe('pure aggregate invariants', () => {
     expect(shifted.totalTokens).toBe(5)
     const aligned = plugin.computeSummary([], archived, { offsetMinutes: 0, archiveOffsetMinutes: 0 })
     expect(aligned.bucketNotice).toBeUndefined()
+  })
+
+  it('releases its routes through ctx.effect so a re-apply can re-register them', () => {
+    // Regression: bare `ctx.webServer.register(...)` left the route behind on
+    // fiber dispose, so the next apply threw "duplicate exact route" and the
+    // fresh fiber stayed failed — usage collection then stopped silently.
+    const first = mount()
+    expect([...first.routes.keys()].sort()).toEqual([
+      '/api/stats-panel/balances',
+      '/api/stats-panel/summary',
+    ])
+    expect(first.disposers).toHaveLength(2)
+
+    // Disposing the fiber runs every registered disposer...
+    for (const dispose of first.disposers) dispose()
+    expect([...first.routes.keys()]).toEqual([])
+
+    // ...so a re-apply on the same server registers cleanly instead of throwing.
+    const second = mount()
+    expect([...second.routes.keys()].sort()).toEqual([
+      '/api/stats-panel/balances',
+      '/api/stats-panel/summary',
+    ])
   })
 })

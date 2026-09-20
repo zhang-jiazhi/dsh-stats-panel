@@ -1,7 +1,7 @@
-/** LAN trust regression tests for the stats-panel HTTP routes. */
+/** LAN trust and settings-parsing regression tests for the stats-panel host half. */
 import type { IncomingMessage } from 'node:http'
 import { describe, expect, it } from 'vitest'
-import { isStatsRequestAllowed } from './index.ts'
+import { isStatsRequestAllowed, parseSimpleYaml } from './index.ts'
 
 function request(
   remoteAddress: string,
@@ -38,5 +38,57 @@ describe('stats-panel request trust', () => {
       origin: 'http://attacker.invalid',
       'sec-fetch-site': 'cross-site',
     }), ['172.19.81.21'])).toBe(false)
+  })
+
+  it('allows a loopback peer addressing a declared lanHost authority', () => {
+    // The panel reached through a hosts-file name that resolves to 127.0.0.1.
+    expect(isStatsRequestAllowed(request('127.0.0.1', {
+      host: 'dsh.local:3080',
+      origin: 'http://dsh.local:3080',
+      'sec-fetch-site': 'same-origin',
+    }), ['dsh.local'])).toBe(true)
+    // The loopback names keep working without any declaration...
+    expect(isStatsRequestAllowed(request('127.0.0.1', {
+      host: 'localhost:3080',
+      origin: 'http://localhost:3080',
+    }), [])).toBe(true)
+    // ...and an undeclared authority on loopback stays rejected.
+    expect(isStatsRequestAllowed(request('127.0.0.1', {
+      host: 'evil.invalid:3080',
+      origin: 'http://evil.invalid:3080',
+    }), ['dsh.local'])).toBe(false)
+  })
+})
+
+describe('parseSimpleYaml', () => {
+  it('strips one layer of quotes from scalars', () => {
+    const parsed = parseSimpleYaml('a: "quoted"\nb: \'single\'\nc: bare\nd: ""\n') as Record<string, string>
+    expect(parsed['a']).toBe('quoted')
+    expect(parsed['b']).toBe('single')
+    expect(parsed['c']).toBe('bare')
+    expect(parsed['d']).toBe('')
+  })
+
+  it('collects scalar block lists instead of dropping them', () => {
+    const parsed = parseSimpleYaml('stats-panel:\n  lanHosts:\n    - 172.19.81.21\n    - dsh.local\n')
+    expect(parsed['stats-panel']).toEqual({ lanHosts: ['172.19.81.21', 'dsh.local'] })
+  })
+
+  it('leaves inline lists as strings for their readers to split', () => {
+    const parsed = parseSimpleYaml('stats-panel:\n  lanHosts: [ 172.19.81.23, dsh.local ]\n')
+    expect((parsed['stats-panel'] as Record<string, unknown>)['lanHosts']).toBe('[ 172.19.81.23, dsh.local ]')
+  })
+
+  it('warns once per parse on an unsupported shape instead of skipping silently', () => {
+    const warnings: string[] = []
+    const warn = console.warn
+    console.warn = (message: unknown) => { warnings.push(String(message)) }
+    try {
+      parseSimpleYaml('models:\n  - id: m1\n    name: M\n')
+    } finally {
+      console.warn = warn
+    }
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('parseSimpleYaml')
   })
 })

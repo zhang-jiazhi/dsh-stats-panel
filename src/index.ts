@@ -323,6 +323,21 @@ export interface ProviderConfig {
 const SETTINGS_PATH = join(DSH_HOME, 'settings.yaml')
 
 /**
+ * [dsh-017-settings-compat-patch:stats-panel] 0.1.7 imports the sections of `settings.yaml`
+ * into the profile and renames the document to `settings.yaml.imported` on first boot, so a
+ * reader pinned to the original path silently loses every override. Read the renamed
+ * document as the fallback; it keeps the same top-level section shape this parser expects.
+ */
+const LEGACY_SETTINGS_PATH = SETTINGS_PATH + '.imported'
+function readSettingsDocument(): string {
+  try {
+    return readFileSync(SETTINGS_PATH, 'utf8')
+  } catch {
+    return readFileSync(LEGACY_SETTINGS_PATH, 'utf8')
+  }
+}
+
+/**
  * The official DeepSeek route. Added to the probe list by the balances route
  * only when DEEPSEEK_API_KEY actually resolves — the unconditional row kept a
  * permanent「未找到凭据」 error card on installs without the credential.
@@ -345,7 +360,7 @@ const DEEPSEEK_OFFICIAL_CONFIG: ProviderConfig = {
 function readProviderConfigs(): ProviderConfig[] {
   const configs: ProviderConfig[] = []
   try {
-    const raw = readFileSync(SETTINGS_PATH, 'utf8')
+    const raw = readSettingsDocument()
     const root = parseSimpleYaml(raw) as Record<string, unknown>
     const piAi = root['llm-pi-ai'] as Record<string, unknown> | undefined
     const providers = (piAi?.['providers'] ?? {}) as Record<string, unknown>
@@ -386,7 +401,7 @@ function readProviderConfigs(): ProviderConfig[] {
  */
 function readLanHosts(): string[] {
   try {
-    const root = parseSimpleYaml(readFileSync(SETTINGS_PATH, 'utf8')) as Record<string, unknown>
+    const root = parseSimpleYaml(readSettingsDocument()) as Record<string, unknown>
     const panel = root['stats-panel'] as Record<string, unknown> | undefined
     const declared = panel?.['lanHosts']
     if (typeof declared === 'string') {
@@ -424,7 +439,7 @@ function readBucketOffsetMinutes(): number {
   const local = -new Date().getTimezoneOffset()
   let declared: unknown
   try {
-    const root = parseSimpleYaml(readFileSync(SETTINGS_PATH, 'utf8')) as Record<string, unknown>
+    const root = parseSimpleYaml(readSettingsDocument()) as Record<string, unknown>
     declared = (root['stats-panel'] as Record<string, unknown> | undefined)?.['dayBoundary']
   } catch {
     return local
